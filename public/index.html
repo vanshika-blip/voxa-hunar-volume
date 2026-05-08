@@ -108,10 +108,6 @@ html,body{margin:0;padding:0;background:var(--bg);font-family:var(--fb);-webkit-
 .chip-cv{background:#fef3c7;color:#92400e}
 .chip-empty{background:#fee2e2;color:#991b1b}
 
-.usage-team-section{margin-bottom:8px}
-.usage-team-hd{padding:8px 14px;background:#f5f5f5;border-bottom:1.5px solid var(--black);font-family:var(--fd);font-weight:900;font-size:10px;letter-spacing:.12em;text-transform:uppercase;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-.usage-team-stat{font-weight:400;color:var(--muted);font-size:10px}
-
 /* ── PILLS / TAGS ── */
 .t-pill{display:inline-flex;font-family:var(--fd);font-weight:700;font-size:8px;letter-spacing:.15em;padding:2px 7px;text-transform:uppercase;white-space:nowrap;border-radius:3px}
 .t-pill-live{background:var(--red);color:#fff}
@@ -333,27 +329,19 @@ input[type=checkbox]{accent-color:var(--black);cursor:pointer}
 .usage-stat-chip.purple{background:#ede9fe;border-color:#c4b5fd;color:#5b21b6}
 .usage-stat-chip.yellow{background:#fef3c7;border-color:#fde68a;color:#92400e}
 
-/* ── STATUS BREAKDOWN ── */
-.status-bd-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px;padding:14px 16px}
-.status-bd-item{border:1.5px solid var(--border);padding:8px 12px;border-radius:3px;display:flex;align-items:center;justify-content:space-between;gap:8px}
-.status-bd-label{font-size:10px;font-family:var(--fb);color:var(--muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.status-bd-count{font-family:var(--fd);font-weight:900;font-size:16px;flex-shrink:0}
-.status-bd-bar{height:3px;background:#eee;margin-top:6px;border-radius:2px}
-.status-bd-bar-fill{height:100%;border-radius:2px}
-
-/* ── MAST SELECT — white bg black text ── */
+/* ── MAST SELECT ── */
 .mast-select{padding:6px 10px;border:1.5px solid rgba(255,255,255,.3);font-size:12px;font-family:var(--fb);background:#fff;color:#000;cursor:pointer;border-radius:2px}
 .mast-select:focus{outline:none;border-color:#fff}
 .mast-select option{background:#fff;color:#000}
 
-/* ── USAGE TEAM CARD ── */
-.usage-team-card{border:1.5px solid var(--border);margin-bottom:12px;background:#fff}
-.usage-team-card-hd{padding:10px 16px;background:var(--black);color:#fff;font-family:var(--fd);font-weight:900;font-size:10px;letter-spacing:.12em;text-transform:uppercase;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
-.usage-team-kpis{display:grid;border-bottom:1px solid var(--border)}
-.usage-team-kpi{padding:10px 14px;text-align:center;border-right:1px solid var(--border)}
-.usage-team-kpi:last-child{border-right:none}
-.usage-team-kpi-v{font-family:var(--fd);font-weight:900;font-size:20px}
-.usage-team-kpi-l{font-family:var(--fd);font-weight:700;font-size:8px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-top:2px}
+/* ── MINUTES TRACKING ── */
+.mt-bar-wrap{display:flex;align-items:center;gap:8px}
+.mt-bar{flex:1;height:6px;background:#eee;border-radius:3px;overflow:hidden;max-width:100px}
+.mt-bar-fill{height:100%;border-radius:3px;transition:width .3s}
+.mt-pct{font-family:var(--fd);font-weight:900;font-size:11px;min-width:34px}
+
+/* ── AGENT GROUP HEADER ── */
+.agent-group-hd{padding:10px 20px 6px;font-family:var(--fd);font-weight:700;font-size:9px;letter-spacing:.2em;text-transform:uppercase;color:var(--muted);background:#f8f8f8;border-bottom:1px solid var(--border);border-top:2px solid var(--black);display:flex;align-items:center;gap:8px}
 </style>
 </head>
 <body>
@@ -387,7 +375,6 @@ async function api(action, payload={}, cacheMs=0) {
 // ── Client-side lead cache (per agent, 5 min TTL) ──
 const _leadCache = {};
 async function fetchLeadsWithCache(agentCode, filter) {
-  // Only cache when no active filters beyond agentCode
   const hasFilter = filter && (filter.search || filter.unassignedOnly || filter.requestId);
   if (!hasFilter) {
     const key = agentCode;
@@ -421,8 +408,8 @@ function Alert({ type, children }) {
   return <div className={"t-alert "+cls}>{children}</div>;
 }
 function RoleTag({ role }) {
-  const map = { super_admin:"t-tag-purple", admin:"t-tag-blue", team_lead:"t-tag-green", recruiter:"t-tag-gray" };
-  const labels = { super_admin:"Super Admin", admin:"Admin", team_lead:"Team Lead", recruiter:"Recruiter" };
+  const map = { super_admin:"t-tag-purple", admin:"t-tag-blue", team_lead:"t-tag-green", recruiter:"t-tag-gray", individual_contributor:"t-tag-red" };
+  const labels = { super_admin:"Super Admin", admin:"Admin", team_lead:"Team Lead", recruiter:"Recruiter", individual_contributor:"IC" };
   return <span className={"t-tag "+(map[role]||"t-tag-gray")}>{labels[role]||role}</span>;
 }
 function StatusPill({ status }) {
@@ -495,9 +482,7 @@ function DateCell({ value }) {
   } catch { return <span className="date-cell">{value}</span>; }
 }
 
-// ─────────────────────────────────────────────────────────────
-// REMARKS MODAL
-// ─────────────────────────────────────────────────────────────
+// ── REMARKS MODAL ──
 function RemarksModal({ name, value, onSave, onClose }) {
   const [text, setText] = useState(value || "");
   return (
@@ -584,6 +569,7 @@ function StatusSelect({ options, value, onChange }) {
 }
 
 const CALL_STATUS_OPTIONS = ["Connected","DNP-1","DNP-2","DNP-3","DNP-4","DNP-5","Hiring On hold","Irrelevant"];
+const TURNUP_OPTIONS = ["Interview Scheduled","Interview Completed","No Show / Not Interested Now","Rejected (After Interview)","Selected / Offer in Process","Backout (Post Offer)"];
 const FEEDBACK_OPTIONS = ["Duplicate / R1 Reject / DNP","Not interested / Not looking for job change","Location issue / Looking for specific city","Out of budget / High salary expectation","Low experience / Fresher","Overaged / Not eligible","Previously Evaluated","Communication gap","Not working currently / Career gap","Currently working – not open to move","Wrong number / Not connected","Other constraint","Relevant but looking for senior role","Not reachable / Call back later","Call back scheduled","CV Awaited / Shared","Interested: Interview Lined up","Interview: Done","Already in process / Selected","Currently Working in same company"];
 const SELECTION_OPTIONS = ["FB Pending","Backout","Offer Backout","Duplicate","Process","Reject","TL Reject","Position on hold","Position Closed","Interview Reject","Telephonic","VC","F2F","Finals","Use Later","On Hold","Offered","Joined","Drop"];
 
@@ -592,35 +578,91 @@ const NAV_ITEMS = [
   { id:"leads",     label:"Leads" },
   { id:"trigger",   label:"Trigger Campaign" },
   { id:"campaigns", label:"Campaigns" },
-  { id:"agents",    label:"Agents", superOnly:true },
-  { id:"users",     label:"Users", hideFor:["recruiter"] },
-  { id:"teams",     label:"Teams", hideFor:["recruiter","team_lead"] },
-  { id:"usage",     label:"Usage", hideFor:["recruiter"] },
+  { id:"myagents",  label:"Agents", showFor:["team_lead","individual_contributor"] },
+  { id:"users",     label:"Users", hideFor:["recruiter","individual_contributor"] },
+  { id:"teams",     label:"Teams", hideFor:["recruiter","team_lead","individual_contributor"] },
 ];
 
-// ── Excel column filter — fixed to use controlled value properly ──
+// ── Multi-select + search column filter ──
 function ExcelColFilter({ header, values, selected, onChange }) {
-  const allVals = useMemo(() => [...new Set(values.map(v=>String(v||"")))].sort((a,b)=>a.localeCompare(b)), [values]);
-  const curVal = (selected && selected.length === 1) ? selected[0] : "";
-  const hasFilter = Boolean(curVal);
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const ref = useRef(null);
+
+  const allVals = useMemo(() => [...new Set(values.map(v=>String(v||"")))].sort((a,b)=>{
+    if(a===""&&b!=="") return -1; if(b===""&&a!=="") return 1;
+    return a.localeCompare(b);
+  }), [values]);
+
+  const sel = useMemo(() => new Set(selected||[]), [selected]);
+  const hasFilter = sel.size > 0;
+
+  const filtered = useMemo(() => {
+    if(!search.trim()) return allVals;
+    const q = search.toLowerCase();
+    return allVals.filter(v => v.toLowerCase().includes(q) || (v===""&&"blank".includes(q)));
+  }, [allVals, search]);
+
+  useEffect(() => {
+    if(!open) return;
+    function handle(e){ if(ref.current && !ref.current.contains(e.target)) setOpen(false); }
+    document.addEventListener("mousedown", handle);
+    return () => document.removeEventListener("mousedown", handle);
+  }, [open]);
+
+  function toggle(v) {
+    const next = new Set(sel);
+    if(next.has(v)) next.delete(v); else next.add(v);
+    onChange(next.size > 0 ? [...next] : null);
+  }
+  function clearAll(e){ e.stopPropagation(); onChange(null); setSearch(""); }
+
+  const label = hasFilter
+    ? sel.size === 1 ? ([...sel][0]||"(blank)") : `${sel.size} selected`
+    : `All ▾`;
+
   return (
-    <select
-      className={"simple-col-filter"+(hasFilter?" has-filter":"")}
-      value={curVal}
-      onChange={e => { const v=e.target.value; onChange(v ? [v] : null); }}
-      title={header}
-    >
-      <option value="">All ▾</option>
-      {allVals.map(v=><option key={v} value={v}>{v||"(blank)"}</option>)}
-    </select>
+    <div ref={ref} style={{position:"relative",width:"100%"}}>
+      <div
+        onClick={()=>setOpen(o=>!o)}
+        className={"simple-col-filter"+(hasFilter?" has-filter":"")}
+        style={{cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"space-between",userSelect:"none",padding:"2px 20px 2px 5px",minWidth:0}}
+        title={hasFilter?[...sel].join(", "):header}
+      >
+        <span style={{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",flex:1}}>{label}</span>
+        {hasFilter&&<span onMouseDown={clearAll} style={{marginLeft:3,cursor:"pointer",opacity:.6,fontSize:9,flexShrink:0}}>✕</span>}
+      </div>
+      {open && (
+        <div style={{position:"absolute",top:"calc(100% + 2px)",left:0,zIndex:99999,background:"#fff",border:"2px solid var(--black)",boxShadow:"3px 3px 0 rgba(0,0,0,.12)",minWidth:160,maxWidth:260,width:"max-content"}}>
+          <div style={{padding:"4px 5px",borderBottom:"1px solid #eee"}}>
+            <input autoFocus value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search…" style={{width:"100%",border:"1px solid #ddd",borderRadius:2,padding:"3px 5px",fontSize:11,fontFamily:"var(--fb)",outline:"none",boxSizing:"border-box"}} onKeyDown={e=>{ if(e.key==="Escape"){setOpen(false);setSearch("");} }} onClick={e=>e.stopPropagation()}/>
+          </div>
+          <div style={{display:"flex",gap:0,borderBottom:"1px solid #eee"}}>
+            <button onMouseDown={e=>{e.preventDefault();onChange(null);setSearch("");}} style={{flex:1,padding:"3px 0",fontSize:10,fontFamily:"var(--fb)",border:"none",borderRight:"1px solid #eee",background:"#fafafa",cursor:"pointer"}}>Clear</button>
+            <button onMouseDown={e=>{e.preventDefault();onChange(filtered.length>0?[...filtered]:null);}} style={{flex:1,padding:"3px 0",fontSize:10,fontFamily:"var(--fb)",border:"none",background:"#fafafa",cursor:"pointer"}}>All shown</button>
+          </div>
+          <div style={{maxHeight:200,overflowY:"auto"}}>
+            {filtered.length===0&&<div style={{padding:"6px 8px",fontSize:11,color:"#999",fontFamily:"var(--fb)"}}>No matches</div>}
+            {filtered.map(v=>{
+              const checked = sel.has(v);
+              return (
+                <label key={v} style={{display:"flex",alignItems:"center",gap:6,padding:"4px 8px",cursor:"pointer",background:checked?"#eef3ff":"transparent",fontSize:11,fontFamily:"var(--fb)"}} onMouseDown={e=>{e.preventDefault();toggle(v);}}>
+                  <input type="checkbox" checked={checked} readOnly style={{width:11,height:11,cursor:"pointer",accentColor:"var(--blue)"}}/>
+                  <span style={{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{v||"(blank)"}</span>
+                </label>
+              );
+            })}
+          </div>
+          {hasFilter&&<div style={{padding:"3px 8px",borderTop:"1px solid #eee",fontSize:10,color:"var(--blue)",fontFamily:"var(--fb)"}}>{sel.size} selected</div>}
+        </div>
+      )}
+    </div>
   );
 }
 
-// ── Table filter hook — fixed to apply filters correctly ──
+// ── Table filter hook ──
 function useTableFilters(data, headers) {
   const [filters, setFilters] = useState({});
-
-  // Reset filters when data/headers change significantly
   useEffect(() => { setFilters({}); }, [headers.join(",")]);
 
   const colValues = useMemo(() => {
@@ -651,8 +693,8 @@ function useTableFilters(data, headers) {
 }
 
 function isDateCol(h) {
-  return /^(date|called.?at|call.?date|start.?time|timestamp|created.?at|called.?on)$/i.test(h)
-    || /date$/i.test(h) || h === "Date";
+  return /^(date|called.?at|call.?date|start.?time|timestamp|created.?at|called.?on|started.?at)$/i.test(h)
+    || /date$/i.test(h) || h === "Date" || h === "Started At";
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -743,6 +785,7 @@ function SetupScreen({ token, onCompleted, goLogin }) {
 function Shell({ user, today, onLogout, view, setView, children, onChangePw }) {
   const visible = NAV_ITEMS.filter(n => {
     if(n.superOnly && user.role!=="super_admin") return false;
+    if(n.showFor && !n.showFor.includes(user.role)) return false;
     if(n.hideFor && n.hideFor.includes(user.role)) return false;
     return true;
   });
@@ -817,7 +860,66 @@ function ChangePasswordModal({ onClose }) {
     </div>
   );
 }
+function CalendarDatePicker({ selected=[], onChange, onClose }) {
+  const today = new Date();
+  const [viewYear, setViewYear] = useState(today.getFullYear());
+  const [viewMonth, setViewMonth] = useState(today.getMonth());
+  const [localSel, setLocalSel] = useState(new Set(selected));
+  const MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+  const pad = n => String(n).padStart(2,'0');
 
+  function prevMonth(){ if(viewMonth===0){setViewYear(y=>y-1);setViewMonth(11);}else setViewMonth(m=>m-1); }
+  function nextMonth(){ if(viewMonth===11){setViewYear(y=>y+1);setViewMonth(0);}else setViewMonth(m=>m+1); }
+
+  const daysInMonth = new Date(viewYear, viewMonth+1, 0).getDate();
+  const firstDay = new Date(viewYear, viewMonth, 1).getDay();
+  const todayStr = `${today.getFullYear()}-${pad(today.getMonth()+1)}-${pad(today.getDate())}`;
+
+  function toggleDate(day){
+    const str = `${viewYear}-${pad(viewMonth+1)}-${pad(day)}`;
+    setLocalSel(prev=>{ const n=new Set(prev); n.has(str)?n.delete(str):n.add(str); return n; });
+  }
+
+  const cells = [...Array(firstDay).fill(null), ...Array.from({length:daysInMonth},(_,i)=>i+1)];
+
+  return (
+    <div style={{background:"#fff",border:"2px solid var(--black)",padding:16,width:290,boxShadow:"4px 4px 0 rgba(0,0,0,.15)"}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
+        <button onClick={prevMonth} style={{background:"none",border:"1.5px solid #ddd",cursor:"pointer",padding:"4px 10px",fontSize:16,fontFamily:"var(--fd)",fontWeight:900}}>‹</button>
+        <span style={{fontFamily:"var(--fd)",fontWeight:900,fontSize:14}}>{MONTHS[viewMonth]} {viewYear}</span>
+        <button onClick={nextMonth} style={{background:"none",border:"1.5px solid #ddd",cursor:"pointer",padding:"4px 10px",fontSize:16,fontFamily:"var(--fd)",fontWeight:900}}>›</button>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:2,marginBottom:6}}>
+        {["Su","Mo","Tu","We","Th","Fr","Sa"].map(d=>(
+          <div key={d} style={{textAlign:"center",fontSize:10,fontFamily:"var(--fd)",fontWeight:700,color:"var(--muted)",padding:"2px 0"}}>{d}</div>
+        ))}
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:2}}>
+        {cells.map((day,i)=>{
+          if(!day) return <div key={i}/>;
+          const str=`${viewYear}-${pad(viewMonth+1)}-${pad(day)}`;
+          const isSel=localSel.has(str);
+          const isToday=str===todayStr;
+          const isFuture=str>todayStr;
+          return (
+            <button key={i} disabled={isFuture} onClick={()=>toggleDate(day)} style={{
+              padding:"7px 0",textAlign:"center",fontSize:12,fontFamily:"var(--fb)",
+              border:isToday?"2px solid var(--black)":"1px solid transparent",
+              background:isSel?"var(--black)":"transparent",
+              color:isSel?"#fff":isFuture?"#ccc":isToday?"var(--red)":"var(--black)",
+              cursor:isFuture?"not-allowed":"pointer",borderRadius:4,
+              fontWeight:isToday?700:400,
+            }}>{day}</button>
+          );
+        })}
+      </div>
+      <div style={{display:"flex",gap:8,marginTop:14,paddingTop:10,borderTop:"1px solid #eee"}}>
+        <button onClick={()=>{setLocalSel(new Set());onChange([]);onClose();}} style={{flex:1,padding:"8px 0",fontSize:11,fontFamily:"var(--fd)",fontWeight:700,border:"1.5px solid var(--border)",background:"#fff",cursor:"pointer"}}>Clear</button>
+        <button onClick={()=>{onChange([...localSel]);onClose();}} style={{flex:2,padding:"8px 0",fontSize:11,fontFamily:"var(--fd)",fontWeight:900,border:"none",background:"var(--black)",color:"#fff",cursor:"pointer"}}>Apply {localSel.size>0?`(${localSel.size})`:""}</button>
+      </div>
+    </div>
+  );
+}
 function AgentPicker({ agents, value, onChange, allowAll }) {
   if(!agents||agents.length===0) return <span style={{fontSize:11,color:"var(--muted)"}}>No agents</span>;
   return (
@@ -830,25 +932,80 @@ function AgentPicker({ agents, value, onChange, allowAll }) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// MINUTES TRACKING BAR COMPONENT
+// ─────────────────────────────────────────────────────────────
+function MinutesBar({ pct, size = "normal" }) {
+  const color = pct >= 90 ? "var(--red)" : pct >= 70 ? "var(--yellow)" : "var(--green)";
+  const h = size === "small" ? 4 : 6;
+  return (
+    <div className="mt-bar-wrap">
+      <div className="mt-bar" style={{height:h}}>
+        <div className="mt-bar-fill" style={{width: Math.min(100,pct)+"%", background:color, height:"100%"}}/>
+      </div>
+      <span className="mt-pct" style={{color: pct>=90?"var(--red)":"var(--black)", fontSize: size==="small"?10:11}}>{pct}%</span>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
 // DASHBOARD
 // ─────────────────────────────────────────────────────────────
 function DashboardView({ user, agents, selectedAgent, setSelectedAgent }) {
-  const [data,setData]=useState(null); const [range,setRange]=useState("7d");
+  const [dashData, setDashData] = useState(null);
+  const [usageData, setUsageData] = useState(null);
+  const [minutesData, setMinutesData] = useState(null); // ← NEW
+  const [range, setRange] = useState("7d");
+  const [customDates, setCustomDates] = useState([]);
+  const [showDatePicker, setShowDatePicker] = useState(false);
+  const [section, setSection] = useState("overview");
+  const [peopleTeamFilter, setPeopleTeamFilter] = useState("");
 
   async function load() {
-    const r = await api("getDashboard",{range,agentCode:selectedAgent});
-    if(r.ok) setData(r);
+    const dateParams = customDates.length > 0 ? {dates: customDates} : {range};
+    const [d, u, m] = await Promise.all([
+      api("getDashboard", {...dateParams, agentCode: selectedAgent}),
+      api("getUsage", dateParams),
+      api("getMinutesTracking", {}),
+    ]);
+    if(d.ok) setDashData(d);
+    if(u.ok) setUsageData(u);
+    if(m.ok) setMinutesData(m); // ← NEW
   }
-  useEffect(()=>{ setData(null); load(); },[range,selectedAgent]);
-  useEffect(()=>{
-    const t = setInterval(load, 5*60*1000);
-    return ()=>clearInterval(t);
-  },[range,selectedAgent]);
 
-  if(!data) return <div style={{display:"flex",justifyContent:"center",padding:60}}><Spin/></div>;
-  const s=data.stats||{};
-  const lineupCount = s.lineupCount || 0;
-  const cvAwaitedCount = s.cvAwaitedCount || 0;
+  useEffect(()=>{ setDashData(null); setUsageData(null); setMinutesData(null); load(); },[range,selectedAgent]);
+  useEffect(()=>{ const t=setInterval(load,5*60*1000); return()=>clearInterval(t); },[range,selectedAgent]);
+
+  if(!dashData||!usageData) return <div style={{display:"flex",justifyContent:"center",padding:60}}><Spin/></div>;
+  const s = dashData.stats||{};
+  const lineupCount = s.lineupCount||0;
+  const cvAwaitedCount = s.cvAwaitedCount||0;
+
+  const byUser = {};
+  (usageData.rows||[]).forEach(r=>{
+    const k=r.email||r.name;
+    if(!byUser[k]) byUser[k]={name:r.name,email:r.email,team:r.team,dailyLimit:r.dailyLimit,totalCalls:0,ql:0,connected:0,lineup:0,cvAwaited:0,emptyStatus:0,fillRate:0};
+    byUser[k].totalCalls+=Number(r.calls||0);
+  });
+  (usageData.leadStats||[]).forEach(ls=>{
+    const k=ls.email;
+    if(byUser[k]){ byUser[k].ql=ls.totalLeads||0; byUser[k].connected=ls.connected||0; byUser[k].lineup=ls.interviewLinedUp||0; byUser[k].cvAwaited=ls.cvAwaited||0; byUser[k].emptyStatus=ls.emptyCallStatus||0; byUser[k].fillRate=ls.fillRate||0; }
+    else { byUser[k]={name:ls.name,email:ls.email,team:ls.team,dailyLimit:0,totalCalls:0,ql:ls.totalLeads||0,connected:ls.connected||0,lineup:ls.interviewLinedUp||0,cvAwaited:ls.cvAwaited||0,emptyStatus:ls.emptyCallStatus||0,fillRate:ls.fillRate||0}; }
+  });
+  const userList = Object.values(byUser).sort((a,b)=>b.ql-a.ql);
+  const grandQL = (usageData.leadStats||[]).reduce((s,ls)=>s+(ls.totalLeads||0),0);
+  const grandConnected = (usageData.leadStats||[]).reduce((s,ls)=>s+(ls.connected||0),0);
+  const grandLineup = (usageData.leadStats||[]).reduce((s,ls)=>s+(ls.interviewLinedUp||0),0);
+  const grandCalls = (usageData.rows||[]).reduce((s,r)=>s+Number(r.calls||0),0);
+
+  const myTeamData = dashData.teamBreakdown && dashData.teamBreakdown.length>0 ? dashData.teamBreakdown[0] : null;
+
+  // ── Build sections based on role ──
+  const SECTIONS = [
+    {id:"overview",   label:"Overview"},
+    {id:"people",     label: user.role==="team_lead"?"Recruiters":"People"},
+    {id:"minutes",    label:"Minutes Tracking"}, // ← NEW
+    ...(user.role==="super_admin"||user.role==="admin" ? [{id:"teams",label:"Teams"}] : []),
+  ];
 
   return (
     <div className="t-fade">
@@ -865,69 +1022,332 @@ function DashboardView({ user, agents, selectedAgent, setSelectedAgent }) {
           <select className="mast-select" value={range} onChange={e=>setRange(e.target.value)}>
             <option value="today">Today</option><option value="7d">Last 7 days</option><option value="30d">Last 30 days</option>
           </select>
-          <button className="t-btn t-btn-outline t-btn-sm" style={{color:"rgba(255,255,255,.7)",borderColor:"rgba(255,255,255,.3)",background:"transparent"}} onClick={load}>↻ Refresh</button>
+<div style={{position:"relative"}}>
+  <button
+    className="t-btn t-btn-outline t-btn-sm"
+    style={{color:customDates.length>0?"var(--yellow)":"rgba(255,255,255,.7)",borderColor:customDates.length>0?"var(--yellow)":"rgba(255,255,255,.3)",background:"transparent"}}
+    onClick={()=>setShowDatePicker(p=>!p)}
+  >
+    {customDates.length>0?`${customDates.length} dates`:"📅 Dates"}
+  </button>
+  {showDatePicker && (
+    <div style={{position:"absolute",top:"calc(100% + 6px)",right:0,zIndex:999}}>
+      <CalendarDatePicker
+        selected={customDates}
+        onChange={dates=>{ setCustomDates(dates); load(); }}
+        onClose={()=>setShowDatePicker(false)}
+      />
+    </div>
+  )}
+</div>
+          <button className="t-btn t-btn-outline t-btn-sm" style={{color:"rgba(255,255,255,.7)",borderColor:"rgba(255,255,255,.3)",background:"transparent"}} onClick={load}>↻</button>
         </div>
       </div>
-      <div className="t-kpis" style={{gridTemplateColumns:"repeat(4,1fr)"}}>
-        {[
-          {label:"Total Calls",value:s.totalCalls||0,color:"#0066b3"},
-          {label:"Total Minutes",value:s.totalMinutes||0,color:"#ffc600"},
-          {label:"Qualified Leads",value:s.qualifiedLeads||0,color:"#009149"},
-          {label:"Conversion",value:(s.conversionRate||0)+"%",color:"#e2001a"}
-        ].map(k=>(
-          <div key={k.label} className="t-kpi">
-            <div className="t-kpi-accent" style={{background:k.color}}/>
-            <div className="t-kpi-label">{k.label}</div>
-            <div className="t-kpi-value">{k.value}</div>
-          </div>
+
+      {/* Section tabs */}
+      <div style={{display:"flex",gap:0,borderBottom:"1.5px solid var(--border)",padding:"0 20px",background:"#fff"}}>
+        {SECTIONS.map(sec=>(
+          <button key={sec.id} onClick={()=>setSection(sec.id)} style={{padding:"10px 18px",fontFamily:"var(--fd)",fontWeight:700,fontSize:11,letterSpacing:".08em",border:"none",borderBottom:section===sec.id?"2.5px solid var(--black)":"2.5px solid transparent",background:"none",cursor:"pointer",color:section===sec.id?"var(--black)":"var(--muted)",marginBottom:-1.5}}>
+            {sec.label}
+          </button>
         ))}
       </div>
-      <div className="t-kpis" style={{gridTemplateColumns:"repeat(6,1fr)"}}>
-        {[
-          {label:"Assigned",value:s.assignedLeads||0,color:"#009149"},
-          {label:"Unassigned",value:s.unassignedLeads||0,color:"#e2001a"},
-          {label:"Connected",value:s.connectedCount||0,color:"#0066b3"},
-          {label:"Callbacks",value:s.callbackCount||0,color:"#ffc600"},
-          {label:"Lineups",value:lineupCount,color:"#009149",highlight:true},
-          {label:"CV Awaited",value:cvAwaitedCount,color:"#854d0e",highlight:"yellow"},
-        ].map(k=>(
-          <div key={k.label} className="t-kpi" style={k.highlight==="yellow"?{background:"#fefce8"}:k.highlight?{background:"#f0fff7"}:{}}>
-            <div className="t-kpi-accent" style={{background:k.color}}/>
-            <div className="t-kpi-label">{k.label}</div>
-            <div className="t-kpi-value" style={k.highlight?{color:k.color}:{}}>{k.value}</div>
+
+      {/* ── OVERVIEW ── */}
+      {section==="overview" && (
+        <>
+          <div className="t-kpis" style={{gridTemplateColumns:"repeat(5,1fr)"}}>
+            {[
+              {label:"Total Calls",value:s.totalCalls||grandCalls||0,color:"#0066b3"},
+              {label:"Qualified Leads",value:grandQL||s.qualifiedLeads||0,color:"#009149"},
+              {label:"Conversion",value:(s.conversionRate||0)+"%",color:"#e2001a"},
+              {label:"Connected",value:grandConnected||s.connectedCount||0,color:"#0369a1"},
+              {label:"Interviews Lined Up",value:grandLineup||lineupCount,color:"#5b21b6",highlight:true},
+            ].map(k=>(
+              <div key={k.label} className="t-kpi" style={k.highlight?{background:"#f5f0ff"}:{}}>
+                <div className="t-kpi-accent" style={{background:k.color}}/>
+                <div className="t-kpi-label">{k.label}</div>
+                <div className="t-kpi-value" style={k.highlight?{color:k.color}:{}}>{k.value}</div>
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
-      {data.timeSeries && data.timeSeries.length>0 && RECHARTS_OK && (
+          <div className="t-kpis" style={{gridTemplateColumns:"repeat(4,1fr)"}}>
+            {[
+              {label:"Callbacks",value:s.callbackCount||0,color:"#ffc600"},
+              {label:"CV Awaited",value:cvAwaitedCount,color:"#854d0e",highlight:"yellow"},
+              {label:"Active Recruiters",value:userList.length,color:"#009149"},
+              {label:"Assigned Leads",value:s.assignedLeads||0,color:"#0066b3"},
+            ].map(k=>(
+              <div key={k.label} className="t-kpi" style={k.highlight==="yellow"?{background:"#fefce8"}:{}}>
+                <div className="t-kpi-accent" style={{background:k.color}}/>
+                <div className="t-kpi-label">{k.label}</div>
+                <div className="t-kpi-value" style={k.highlight?{color:k.color}:{}}>{k.value}</div>
+              </div>
+            ))}
+          </div>
+          {dashData.timeSeries && dashData.timeSeries.length>0 && RECHARTS_OK && (
+            <div className="t-board">
+              <div className="t-board-hd"><h2 className="t-board-hd-title">Calls &amp; Qualified Leads Over Time</h2></div>
+              <div style={{padding:"16px 20px"}}>
+                <R.ResponsiveContainer width="100%" height={220}>
+                  <R.LineChart data={dashData.timeSeries}>
+                    <R.CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0"/>
+                    <R.XAxis dataKey="day" fontSize={10} tick={{fill:"#888",fontFamily:"var(--fm)"}}/>
+                    <R.YAxis fontSize={10} tick={{fill:"#888",fontFamily:"var(--fm)"}}/>
+                    <R.Tooltip contentStyle={{border:"1.5px solid #0a0a0a",borderRadius:0,fontSize:11}}/>
+                    <R.Legend/>
+                    <R.Line type="monotone" dataKey="calls" stroke="#0066b3" strokeWidth={2} dot={false}/>
+                    <R.Line type="monotone" dataKey="qualified" stroke="#009149" strokeWidth={2} dot={false}/>
+                  </R.LineChart>
+                </R.ResponsiveContainer>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      {/* ── PEOPLE ── */}
+      {section==="people" && (
         <div className="t-board">
-          <div className="t-board-hd"><h2 className="t-board-hd-title">Calls Over Time</h2></div>
-          <div style={{padding:"16px 20px"}}>
-            <R.ResponsiveContainer width="100%" height={220}>
-              <R.LineChart data={data.timeSeries}>
-                <R.CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0"/>
-                <R.XAxis dataKey="day" fontSize={10} tick={{fill:"#888",fontFamily:"var(--fm)"}}/>
-                <R.YAxis fontSize={10} tick={{fill:"#888",fontFamily:"var(--fm)"}}/>
-                <R.Tooltip contentStyle={{border:"1.5px solid #0a0a0a",borderRadius:0,fontSize:11}}/>
-                <R.Legend/>
-                <R.Line type="monotone" dataKey="calls" stroke="#e2001a" strokeWidth={2} dot={false}/>
-                <R.Line type="monotone" dataKey="qualified" stroke="#009149" strokeWidth={2} dot={false}/>
-              </R.LineChart>
-            </R.ResponsiveContainer>
+          <div className="t-board-hd">
+            <h2 className="t-board-hd-title">{user.role==="team_lead"?"Recruiter Performance":"People Performance"}</h2>
+            <div style={{display:"flex",alignItems:"center",gap:10}}>
+              <span className="t-board-meta">{userList.length} people</span>
+              {user.role!=="team_lead" && (
+                <select style={{padding:"4px 8px",fontSize:11,fontFamily:"var(--fb)",border:"1.5px solid var(--border)",borderRadius:2}} value={peopleTeamFilter||""} onChange={e=>setPeopleTeamFilter(e.target.value)}>
+                  <option value="">All Teams</option>
+                  {[...new Set(userList.map(u=>u.team).filter(Boolean))].sort().map(t=><option key={t} value={t}>{t}</option>)}
+                </select>
+              )}
+            </div>
+          </div>
+
+          {user.role==="team_lead" && myTeamData && myTeamData.agents && myTeamData.agents.length>0 && (
+            <div style={{padding:"16px 20px",display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))",gap:12,borderBottom:"1px solid var(--border)"}}>
+              {myTeamData.agents.map(a=>(
+                <div key={a.email} style={{border:"1.5px solid var(--border)",padding:14,background:"#fff"}}>
+                  <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12}}>
+                    <Disc name={a.name||a.email}/>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontFamily:"var(--fd)",fontWeight:900,fontSize:13,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{a.name||a.email}</div>
+                      <div style={{fontSize:10,color:"var(--muted)",fontFamily:"var(--fm)",overflow:"hidden",textOverflow:"ellipsis"}}>{a.email}</div>
+                    </div>
+                  </div>
+                  <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:6,marginBottom:10}}>
+                    {[
+                      {l:"Calls",v:a.totalCalls||0,c:"#0066b3"},
+                      {l:"QL",v:a.qualifiedLeads||0,c:"#009149"},
+                      {l:"Connected",v:a.connectedCount||0,c:"#0369a1"},
+                      {l:"Lined Up",v:a.lineupCount||0,c:"#5b21b6"},
+                      {l:"CV Awaited",v:a.cvAwaited||0,c:"#92400e"},
+                      {l:"Empty Status",v:a.emptyCallStatus||0,c:"#e2001a"},
+                    ].map(k=>(
+                      <div key={k.l} style={{textAlign:"center",padding:"6px 4px",background:"#f9f9f9",border:"1px solid #eee"}}>
+                        <div style={{fontFamily:"var(--fd)",fontWeight:900,fontSize:15,color:k.c}}>{k.v}</div>
+                        <div style={{fontSize:8,color:"var(--muted)",fontFamily:"var(--fd)",fontWeight:700,letterSpacing:".05em",textTransform:"uppercase"}}>{k.l}</div>
+                      </div>
+                    ))}
+                  </div>
+                  {(a.emptyCallStatus||0)>0 && (
+                    <div style={{background:"#fff5f5",border:"1px solid #fecaca",padding:"4px 8px",fontSize:10,color:"var(--red)",fontFamily:"var(--fd)",fontWeight:700}}>
+                      ⚠ {a.emptyCallStatus} leads without call status
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {user.role!=="team_lead" && (
+            <div style={{padding:"12px 16px",display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))",gap:10,borderBottom:"1px solid var(--border)"}}>
+              {userList.filter(u=>!peopleTeamFilter||u.team===peopleTeamFilter).map(u=>(
+                <div key={u.email} style={{border:"1.5px solid var(--border)",padding:14,background:"#fff"}}>
+                  <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+                    <Disc name={u.name||u.email}/>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontFamily:"var(--fd)",fontWeight:900,fontSize:13}}>{u.name||u.email}</div>
+                      <div style={{fontSize:10,color:"var(--muted)",fontFamily:"var(--fm)"}}>{u.team||"No team"}</div>
+                    </div>
+                  </div>
+                  <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+                    <span className="usage-stat-chip blue"><b>{u.totalCalls}</b><span>calls</span></span>
+                    <span className="usage-stat-chip green"><b>{u.ql}</b><span>QL</span></span>
+                    <span className="usage-stat-chip blue"><b>{u.connected}</b><span>conn</span></span>
+                    <span className="usage-stat-chip purple"><b>{u.lineup}</b><span>lineup</span></span>
+                    <span className="usage-stat-chip yellow"><b>{u.cvAwaited}</b><span>CV</span></span>
+                    {u.emptyStatus>0 && <span className="usage-stat-chip red"><b>{u.emptyStatus}</b><span>empty</span></span>}
+                  </div>
+                  
+                </div>
+              ))}
+              {userList.length===0 && <div style={{gridColumn:"1/-1",padding:32,textAlign:"center",color:"var(--muted)",fontFamily:"var(--fd)",fontWeight:700}}>No recruiter data for this period.</div>}
+            </div>
+          )}
+
+          <div className="t-tbl-wrap">
+            <table className="t-tbl">
+              <thead><tr><th>Name</th><th>Team</th><th>Calls</th><th>QL</th><th>Connected</th><th>Lined Up</th><th>CV Awaited</th><th style={{color:"var(--red)"}}>Empty Status</th></tr></thead><thead><tr><th>Name</th><th>Team</th><th>Calls</th><th>QL</th><th>Connected</th><th>Lined Up</th><th>CV Awaited</th><th style={{color:"var(--red)"}}>Empty Status</th></tr></thead>
+              <tbody>
+                {userList.filter(u=>!peopleTeamFilter||u.team===peopleTeamFilter).map((u,i)=>(
+                  <tr key={i}>
+                    <td><div className="t-tbl nm">{u.name||u.email}</div><div className="t-tbl nm-sub">{u.email}</div></td>
+                    <td style={{fontSize:11}}>{u.team||"—"}</td>
+                    <td className="t-mono">{u.totalCalls}</td>
+                    <td><span className="usage-stat-chip green" style={{fontSize:10}}><b>{u.ql}</b></span></td>
+                    <td><span className="usage-stat-chip blue" style={{fontSize:10}}><b>{u.connected}</b></span></td>
+                    <td><span className="usage-stat-chip purple" style={{fontSize:10}}><b>{u.lineup}</b></span></td>
+                    <td><span className="usage-stat-chip yellow" style={{fontSize:10}}><b>{u.cvAwaited}</b></span></td>
+                    <td>{u.emptyStatus>0?<span className="usage-stat-chip red" style={{fontSize:10}}><b>{u.emptyStatus}</b></span>:<span style={{color:"var(--green)",fontSize:11}}>✓</span>}</td>
+                    
+                  </tr>
+                ))}
+                {userList.length===0 && <tr><td colSpan={9} style={{textAlign:"center",color:"var(--muted)",padding:32}}>No data.</td></tr>}
+              </tbody>
+            </table>
           </div>
         </div>
       )}
 
-      {user && (user.role==="admin"||user.role==="super_admin") && data.teamBreakdown && data.teamBreakdown.length>0 && (
+      {/* ── MINUTES TRACKING — NEW ── */}
+      {section==="minutes" && (
         <div className="t-board">
-          <div className="t-board-hd"><h2 className="t-board-hd-title">Team Breakdown</h2><span className="t-board-meta">{data.teamBreakdown.length} teams</span></div>
+          <div className="t-board-hd">
+            <h2 className="t-board-hd-title">Minutes Tracking</h2>
+            <span className="t-board-meta">
+              {minutesData ? minutesData.month : "Loading…"} · {minutesData ? (minutesData.tracking||[]).length : 0} active users
+            </span>
+          </div>
+
+          {!minutesData && <div style={{padding:60,textAlign:"center"}}><Spin/></div>}
+
+          {minutesData && (minutesData.tracking||[]).length === 0 && (
+            <div className="t-empty">No minute usage recorded this month.</div>
+          )}
+
+          {minutesData && (minutesData.tracking||[]).length > 0 && (
+            <>
+              {/* Summary KPIs */}
+              <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",borderBottom:"2px solid var(--black)"}}>
+                {[
+                  {label:"Total MTD Calls", value: (minutesData.tracking||[]).reduce((a,t)=>a+t.mtdCalls,0), color:"#0066b3"},
+                  {label:"Total MTD Minutes", value: Math.round((minutesData.tracking||[]).reduce((a,t)=>a+t.mtdMinutes,0)), color:"#009149"},
+                  {label:"Today's Calls", value: (minutesData.tracking||[]).reduce((a,t)=>a+t.todayCalls,0), color:"#e2001a"},
+                  {label:"Today's Minutes", value: Math.round((minutesData.tracking||[]).reduce((a,t)=>a+t.todayMinutes,0)), color:"#5b21b6"},
+                ].map(k=>(
+                  <div key={k.label} className="t-kpi">
+                    <div className="t-kpi-accent" style={{background:k.color}}/>
+                    <div className="t-kpi-label">{k.label}</div>
+                    <div className="t-kpi-value">{k.value}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Recruiter cards — group by team */}
+              {(() => {
+                const tracking = minutesData.tracking || [];
+                const byTeam = {};
+                tracking.forEach(t => {
+                  const teamKey = t.team || "— No Team —";
+                  if(!byTeam[teamKey]) byTeam[teamKey] = [];
+                  byTeam[teamKey].push(t);
+                });
+                return Object.entries(byTeam).sort(([a],[b])=>a.localeCompare(b)).map(([team, members]) => (
+                  <div key={team}>
+                    <div className="agent-group-hd">
+                      <span>{team}</span>
+                      <span style={{fontWeight:400,color:"var(--muted)"}}>
+                        {members.length} user{members.length!==1?"s":""} ·{" "}
+                        {Math.round(members.reduce((a,m)=>a+m.mtdMinutes,0))} MTD mins
+                      </span>
+                    </div>
+                    <div className="t-tbl-wrap">
+                      <table className="t-tbl">
+                        <thead>
+                          <tr>
+                            <th>Recruiter</th>
+                            <th>Role</th>
+                            <th>Daily Limit</th>
+                            <th>Today Mins</th>
+                            <th>Today Calls</th>
+                            <th>Today Usage</th>
+                            <th>MTD Mins</th>
+                            <th>MTD Calls</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {members.map(t => (
+                            <tr key={t.email}>
+                              <td>
+                                <div className="t-tbl nm">{t.name}</div>
+                                <div className="t-tbl nm-sub">{t.email}</div>
+                              </td>
+                              <td><RoleTag role={t.role}/></td>
+                              <td className="t-mono">{t.dailyLimit > 0 ? t.dailyLimit+"m" : <span style={{color:"var(--green)",fontSize:10}}>∞ Unlimited</span>}</td>
+                              <td>
+                                <span className={`usage-stat-chip ${t.todayMinutes > 0 ? "blue" : ""}`}>
+                                  <b>{t.todayMinutes}</b><span>min</span>
+                                </span>
+                              </td>
+                              <td className="t-mono">{t.todayCalls}</td>
+                              <td style={{minWidth:140}}>
+                                {t.dailyLimit > 0
+                                  ? <MinutesBar pct={t.todayUsagePct}/>
+                                  : <span style={{fontSize:10,color:"var(--green)",fontFamily:"var(--fd)",fontWeight:700}}>∞ No cap</span>
+                                }
+                              </td>
+                              <td>
+                                <span className={`usage-stat-chip ${t.mtdMinutes > 0 ? "purple" : ""}`}>
+                                  <b>{t.mtdMinutes}</b><span>min</span>
+                                </span>
+                              </td>
+                              <td className="t-mono">{t.mtdCalls}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                ));
+              })()}
+
+              {/* Alert rows — users near/over limit */}
+              {(() => {
+                const nearLimit = (minutesData.tracking||[]).filter(t => t.dailyLimit > 0 && t.todayUsagePct >= 80);
+                if(nearLimit.length === 0) return null;
+                return (
+                  <div style={{padding:"12px 20px",borderTop:"2px solid var(--black)",background:"#fffbe0"}}>
+                    <div style={{fontFamily:"var(--fd)",fontWeight:900,fontSize:11,letterSpacing:".12em",textTransform:"uppercase",marginBottom:8,color:"#92400e"}}>
+                      ⚠ Near / Over Daily Limit ({nearLimit.length})
+                    </div>
+                    <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
+                      {nearLimit.map(t => (
+                        <div key={t.email} style={{background:"#fff",border:`2px solid ${t.todayUsagePct>=100?"var(--red)":"var(--yellow)"}`,padding:"6px 12px",borderRadius:4,minWidth:180}}>
+                          <div style={{fontFamily:"var(--fd)",fontWeight:700,fontSize:11}}>{t.name}</div>
+                          <div style={{fontSize:10,color:"var(--muted)",fontFamily:"var(--fm)"}}>{t.email}</div>
+                          <div style={{marginTop:4}}><MinutesBar pct={t.todayUsagePct} size="small"/></div>
+                          <div style={{fontSize:9,color:"var(--muted)",marginTop:2}}>{t.todayMinutes}/{t.dailyLimit} min used today</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })()}
+            </>
+          )}
+        </div>
+      )}
+
+      {/* ── TEAMS ── */}
+      {section==="teams" && (user.role==="admin"||user.role==="super_admin") && dashData.teamBreakdown && (
+        <div className="t-board">
+          <div className="t-board-hd"><h2 className="t-board-hd-title">Team Breakdown</h2><span className="t-board-meta">{dashData.teamBreakdown.length} teams</span></div>
           <div className="team-breakdown-grid">
-            {data.teamBreakdown.map(team=>(
+            {dashData.teamBreakdown.map(team=>(
               <div key={team.teamId||team.teamName} className="team-bd-card">
                 <div className="team-bd-name">{team.teamName||"Unnamed Team"}</div>
-                <div className="team-bd-kpis" style={{gridTemplateColumns:"repeat(7,1fr)"}}>
+                <div className="team-bd-kpis" style={{gridTemplateColumns:"repeat(6,1fr)"}}>
                   {[
                     {l:"Calls",v:team.totalCalls||0,c:"#0066b3"},
-                    {l:"Minutes",v:team.totalMinutes||0,c:"#ffc600"},
                     {l:"QL",v:team.qualifiedLeads||0,c:"#009149"},
                     {l:"Connected",v:team.connectedCount||0,c:"#0369a1"},
                     {l:"Lined Up",v:team.lineupCount||0,c:"#5b21b6"},
@@ -946,7 +1366,6 @@ function DashboardView({ user, agents, selectedAgent, setSelectedAgent }) {
                       <div key={a.email} className="team-bd-agent-row">
                         <span className="team-bd-agent-name">{a.name||a.email}</span>
                         <span className="team-bd-agent-chip chip-calls">{a.totalCalls||0} calls</span>
-                        <span className="team-bd-agent-chip chip-min">{a.totalMinutes||0} min</span>
                         <span className="team-bd-agent-chip chip-ql">{a.qualifiedLeads||0} QL</span>
                         <span className="team-bd-agent-chip chip-conn">{a.connectedCount||0} conn</span>
                         <span className="team-bd-agent-chip chip-lineup">{a.lineupCount||0} lineup</span>
@@ -966,7 +1385,7 @@ function DashboardView({ user, agents, selectedAgent, setSelectedAgent }) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// LEADS VIEW — with debounced search + client-side cache
+// LEADS VIEW
 // ─────────────────────────────────────────────────────────────
 function LeadsView({ user, users, agents, teams, initialFilter, onClearFilter }) {
   const [selAgent, setSelAgent] = useState(initialFilter?.agentCode || (agents[0]?.agentCode||""));
@@ -974,7 +1393,7 @@ function LeadsView({ user, users, agents, teams, initialFilter, onClearFilter })
   const [headers, setHeaders] = useState([]);
   const [loading, setLoading] = useState(true);
   const [searchInput, setSearchInput] = useState("");
-  const search = useDebounce(searchInput, 300); // debounce search
+  const search = useDebounce(searchInput, 300);
   const [unassignedOnly, setUnassignedOnly] = useState(false);
   const [reqFilter, setReqFilter] = useState(initialFilter?.requestId || "");
   const [busy, setBusy] = useState(false);
@@ -984,27 +1403,21 @@ function LeadsView({ user, users, agents, teams, initialFilter, onClearFilter })
   const [lastRefresh, setLastRefresh] = useState(null);
   const [selTeam, setSelTeam] = useState("");
 
-  // Team filter by member emails
   const teamFilterEmails = useMemo(() => {
     if (!selTeam) return null;
-    const teamMembers = users.filter(u => u.teamId === selTeam || u.team === selTeam && (u.role === "recruiter" || u.role === "team_lead"));
+    const teamMembers = users.filter(u => u.team === selTeam);
     return new Set(teamMembers.map(u => u.email.toLowerCase()));
   }, [selTeam, users]);
 
   async function refresh() {
     setLoading(true);
     if(!selAgent) {
-      // All agents — fetch all leads across visible agents
       const r = await api("getLeads", { agentCode: "", filter: { search, unassignedOnly, requestId: reqFilter||undefined } });
       setLoading(false);
       if(r.ok){setLeads(r.leads||[]);setHeaders(r.headers||[]);setLastRefresh(new Date());}
       return;
     }
-    const r = await fetchLeadsWithCache(selAgent, {
-      search,
-      unassignedOnly,
-      requestId: reqFilter||undefined
-    });
+    const r = await fetchLeadsWithCache(selAgent, { search, unassignedOnly, requestId: reqFilter||undefined });
     setLoading(false);
     if(r.ok){setLeads(r.leads||[]);setHeaders(r.headers||[]);setLastRefresh(new Date());}
   }
@@ -1016,7 +1429,7 @@ function LeadsView({ user, users, agents, teams, initialFilter, onClearFilter })
     return ()=>clearInterval(t);
   },[selAgent, search, unassignedOnly, reqFilter]);
 
-  const fixedCols = ["Callee Name","Mobile Number","Assigned To Email","Call Status","Feedback","Selection Process","Remarks","Recording URL"];
+  const fixedCols = ["Callee Name","Mobile Number","Started At","Assigned To Email","Call Status","Feedback","Selection Process","Turnup Status","Remarks","Recording URL"];
   const dateCols = headers.filter(h => isDateCol(h) && !fixedCols.includes(h));
   const outCols = headers.filter(h=>h.startsWith("out."));
   const inCols = headers.filter(h=>h.startsWith("in."));
@@ -1025,7 +1438,6 @@ function LeadsView({ user, users, agents, teams, initialFilter, onClearFilter })
   const { filters, filtered: rawFiltered, colValues, setColFilter, clearFilters } = useTableFilters(leads, shownHeaders);
   const hasFilters = Object.keys(filters).length > 0;
 
-  // Apply team filter on top of column filters
   const filteredLeads = useMemo(() => {
     let result = rawFiltered;
     if (teamFilterEmails) {
@@ -1067,15 +1479,9 @@ function LeadsView({ user, users, agents, teams, initialFilter, onClearFilter })
   }
 
   async function handleCellChange(callId, field, value) {
-    // Optimistic update — instant UI response
     setLeads(prev => prev.map(l => l["Call ID"] === callId ? {...l, [field]: value} : l));
-    // Save in background
     const r = await api("updateLead",{agentCode:selAgent,callId,fields:{[field]:value}});
-    if (!r.ok) {
-      // Revert on failure
-      invalidateLeadCache(selAgent);
-      refresh();
-    }
+    if (!r.ok) { invalidateLeadCache(selAgent); refresh(); }
   }
 
   function renderCell(h, val, lead) {
@@ -1085,6 +1491,7 @@ function LeadsView({ user, users, agents, teams, initialFilter, onClearFilter })
     if(h==="Call Status") return <StatusSelect options={CALL_STATUS_OPTIONS} value={strVal} onChange={v=>handleCellChange(lead["Call ID"],"Call Status",v)}/>;
     if(h==="Feedback") return <StatusSelect options={FEEDBACK_OPTIONS} value={strVal} onChange={v=>handleCellChange(lead["Call ID"],"Feedback",v)}/>;
     if(h==="Selection Process") return <StatusSelect options={SELECTION_OPTIONS} value={strVal} onChange={v=>handleCellChange(lead["Call ID"],"Selection Process",v)}/>;
+    if(h==="Turnup Status") return <StatusSelect options={TURNUP_OPTIONS} value={strVal} onChange={v=>handleCellChange(lead["Call ID"],"Turnup Status",v)}/>;
     if(h==="Remarks") return <RemarksCell name={String(lead["Callee Name"]||"")} value={strVal} onSave={v=>handleCellChange(lead["Call ID"],"Remarks",v)}/>;
     if(!strVal) return <span style={{color:"#ccc"}}>—</span>;
     if(h.startsWith("out.")||h.startsWith("in.")) return <div className="out-cell" title={strVal}>{strVal}</div>;
@@ -1116,7 +1523,6 @@ function LeadsView({ user, users, agents, teams, initialFilter, onClearFilter })
           </div>
         </div>
         <div className="t-mast-r">
-          {/* Team filter — white bg */}
           {teams && teams.length>0 && (
             <select className="mast-select" value={selTeam} onChange={e=>setSelTeam(e.target.value)} style={{minWidth:130}}>
               <option value="">All Teams</option>
@@ -1136,7 +1542,6 @@ function LeadsView({ user, users, agents, teams, initialFilter, onClearFilter })
       </div>
 
       <div style={{flex:1,background:"var(--white)"}}>
-        {false && <div className="t-empty">Pick an agent to view leads.</div>}
         {selAgent && loading && <div style={{padding:60,textAlign:"center"}}><Spin/></div>}
         {selAgent && !loading && filteredLeads.length===0 && <div className="t-empty">No leads found.</div>}
         {selAgent && !loading && leads.length>0 && (
@@ -1343,7 +1748,7 @@ function UploadView({ user, agents, refreshMe }) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// CAMPAIGNS VIEW — team filter fixed
+// CAMPAIGNS VIEW
 // ─────────────────────────────────────────────────────────────
 function CampaignsView({ agents, user, teams, onViewLeads }) {
   const [selAgent,setSelAgent]=useState("");
@@ -1360,9 +1765,8 @@ function CampaignsView({ agents, user, teams, onViewLeads }) {
     return <CampaignDetail campaign={openCampaign} agents={agents} tab={campaignTab} setTab={setCampaignTab} onBack={()=>setOpenCampaign(null)} onViewLeads={onViewLeads}/>;
   }
 
-  // Fix: filter by team using triggeredByTeam field
   const displayRows = selTeam
-    ? rows.filter(r => r.triggeredByTeam === selTeam || r.triggeredByTeamId === selTeam || (teams.find(t=>t.id===selTeam||t.name===selTeam)?.name) === r.triggeredByTeam)
+    ? rows.filter(r => r.triggeredByTeam === selTeam)
     : rows;
 
   const live=displayRows.filter(r=>r.status==="IN_PROGRESS").length;
@@ -1380,7 +1784,6 @@ function CampaignsView({ agents, user, teams, onViewLeads }) {
           <AgentPicker agents={agents} value={selAgent} onChange={setSelAgent} allowAll/>
         </div>
       </div>
-      {/* Team tabs — white bg black text */}
       {teams && teams.length>0 && (user.role==="admin"||user.role==="super_admin") && (
         <div style={{display:"flex",gap:0,borderBottom:"2px solid var(--black)",background:"#fff",overflowX:"auto"}}>
           <div className={"t-tab"+(selTeam===""?" active":"")} onClick={()=>setSelTeam("")}>All Teams</div>
@@ -1489,7 +1892,7 @@ function CampaignQualifiedTab({ campaign }) {
     })();
   },[campaign.requestId]);
 
-  const fixedCols = ["Callee Name","Mobile Number","Assigned To Email","Call Status","Feedback","Selection Process","Remarks","Recording URL"];
+const fixedCols = ["Callee Name","Mobile Number","Started At","Assigned To Email","Call Status","Feedback","Selection Process","Turnup Status","Remarks","Recording URL"];
   const dateCols = headers.filter(h => isDateCol(h) && !fixedCols.includes(h));
   const outCols = headers.filter(h=>h.startsWith("out."));
   const inCols = headers.filter(h=>h.startsWith("in."));
@@ -1509,7 +1912,7 @@ function CampaignQualifiedTab({ campaign }) {
     if(isDateCol(h)) return <DateCell value={strVal}/>;
     if(!strVal) return <span style={{color:"#ccc"}}>—</span>;
     if(h==="Remarks") return <RemarksCell name={String(lead?.["Callee Name"]||"")} value={strVal} readOnly/>;
-    if(h==="Call Status"||h==="Feedback"||h==="Selection Process") return <LeadPill value={strVal}/>;
+    if(h==="Call Status"||h==="Feedback"||h==="Selection Process"||h==="Turnup Status") return <LeadPill value={strVal}/>;
     if(h.startsWith("out.")||h.startsWith("in.")) return <div className="out-cell" title={strVal}>{strVal}</div>;
     if(h==="Mobile Number") return <span className="t-mono">{strVal}</span>;
     return <span style={{fontSize:12}}>{strVal}</span>;
@@ -1681,32 +2084,88 @@ function CampaignNotConnectedTab({ campaign }) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// AGENTS VIEW
+// AGENTS VIEW (super_admin)
 // ─────────────────────────────────────────────────────────────
-function AgentsView({ onChange }) {
+function AgentsView({ onChange, users }) {
   const [agents,setAgents]=useState([]); const [loading,setLoading]=useState(true);
   const [busy,setBusy]=useState(false); const [editing,setEditing]=useState(null); const [msg,setMsg]=useState("");
+  const [viewMode,setViewMode]=useState("all"); // "all" | "byteam"
   async function refresh(){ setLoading(true); const r=await api("listAgents",{}); setLoading(false); if(r.ok){setAgents(r.agents||[]);onChange&&onChange(r.agents||[]);} }
   useEffect(()=>{refresh();},[]);
   async function sync(){ setBusy(true); setMsg(""); const r=await api("syncAgents",{}); setBusy(false); if(!r.ok)return setMsg("Sync failed: "+(r.message||r.error)); setMsg("Synced "+r.synced+" agents."); refresh(); }
   async function save(a){ const r=await api("upsertAgent",{agent:a}); if(!r.ok)return alert(r.message||r.error); setEditing(null); refresh(); }
   async function toggleActive(a){ await api("upsertAgent",{agent:{agentCode:a.agentCode,active:!a.active}}); refresh(); }
   const active=agents.filter(a=>a.active).length;
+  // Build per-team agent breakdown from createdBy
+  const teamAgents = useMemo(()=>{
+    const emailToTeam = {};
+    (users||[]).forEach(u=>{ if(u.team && u.email) emailToTeam[u.email.toLowerCase()]=u.team; });
+    const byTeam = {};
+    agents.forEach(a=>{
+      const team = emailToTeam[(a.createdBy||"").toLowerCase()] || "(unassigned)";
+      if(!byTeam[team]) byTeam[team]=[];
+      byTeam[team].push(a);
+    });
+    return byTeam;
+  },[agents,users]);
   return (
     <div className="t-fade">
       <div className="t-mast">
         <div><div className="t-mast-title">Agents</div><div className="t-mast-sub">{agents.length} total · {active} active</div></div>
-        <button onClick={sync} disabled={busy} className="t-btn t-btn-outline" style={{color:"var(--black)",borderColor:"var(--black)"}}>{busy?<Spin/>:"Sync from Hunar"}</button>
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={sync} disabled={busy} className="t-btn t-btn-outline" style={{color:"var(--black)",borderColor:"var(--black)"}}>{busy?<Spin/>:"Sync from Hunar"}</button>
+        </div>
       </div>
       {msg && <div style={{padding:"10px 20px"}}><Alert type="info">{msg}</Alert></div>}
-      <div className="t-board">
+      <div style={{padding:"0 20px",display:"flex",gap:0,borderBottom:"2px solid var(--border)",background:"#fff"}}>
+        {[{id:"all",label:"All Agents"},{id:"byteam",label:"By Team"}].map(t=>(
+          <button key={t.id} onClick={()=>setViewMode(t.id)} style={{padding:"10px 18px",fontFamily:"var(--fd)",fontWeight:700,fontSize:11,letterSpacing:".08em",border:"none",borderBottom:viewMode===t.id?"2.5px solid var(--black)":"2.5px solid transparent",background:"none",cursor:"pointer",color:viewMode===t.id?"var(--black)":"var(--muted)"}}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+      {viewMode==="byteam" && (
+        <div style={{padding:20}}>
+          {Object.keys(teamAgents).sort((a,b)=>a==="(unassigned)"?1:b==="(unassigned)"?-1:a.localeCompare(b)).map(teamName=>(
+            <div key={teamName} style={{marginBottom:24,border:"1.5px solid var(--border)",borderRadius:4,overflow:"hidden"}}>
+              <div style={{background:"var(--black)",color:"#fff",padding:"10px 16px",fontFamily:"var(--fd)",fontWeight:900,fontSize:12,letterSpacing:".12em",textTransform:"uppercase",display:"flex",alignItems:"center",gap:10}}>
+                <span>{teamName}</span>
+                <span style={{fontWeight:400,opacity:.6,fontSize:10,letterSpacing:".05em"}}>{teamAgents[teamName].filter(a=>a.active).length} active · {teamAgents[teamName].length} total</span>
+              </div>
+              <div style={{padding:12,display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))",gap:10}}>
+                {teamAgents[teamName].map(a=>(
+                  <div key={a.agentCode} style={{background:"#fafafa",border:"1.5px solid #e8e8e8",borderRadius:6,padding:"12px 14px"}}>
+                    <div style={{fontFamily:"var(--fd)",fontWeight:900,fontSize:13,marginBottom:3,display:"flex",alignItems:"center",gap:8}}>
+                      {a.displayName}
+                      {a.active?<span className="t-pill t-pill-done" style={{fontSize:7}}>Live</span>:<span className="t-pill t-pill-arch" style={{fontSize:7}}>Off</span>}
+                    </div>
+                    <div style={{fontFamily:"var(--fm)",fontSize:10,color:"var(--muted)",marginBottom:4}}>{a.agentCode}</div>
+                    <div style={{fontSize:10,color:"#888"}}>Added by: <b style={{color:"var(--black)"}}>{a.createdBy||"—"}</b></div>
+                    {(a.qualificationRules||[]).length>0 ? (
+                      <div style={{marginTop:4,fontSize:9,color:"var(--green)",fontWeight:700}}>✓ {(a.qualificationRules||[]).length} qual rule{(a.qualificationRules||[]).length!==1?"s":""}</div>
+                    ) : (
+                      <div style={{marginTop:4,fontSize:9,color:"var(--muted)"}}>No qual rules</div>
+                    )}
+                    <div style={{marginTop:8,display:"flex",gap:6}}>
+                      <button onClick={()=>setEditing(a)} className="t-btn t-btn-outline t-btn-sm">Edit</button>
+                      <button onClick={()=>toggleActive(a)} className="t-btn t-btn-outline t-btn-sm">{a.active?"Deactivate":"Activate"}</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+          {Object.keys(teamAgents).length===0 && <div className="t-empty">No agents yet.</div>}
+        </div>
+      )}
+      {viewMode==="all" && (<div className="t-board">
         <div className="t-board-hd"><h2 className="t-board-hd-title">All Agents</h2><span className="t-board-meta">{agents.length} agents</span></div>
         {loading ? <div style={{padding:60,textAlign:"center"}}><Spin/></div> : agents.length===0 ? (
           <div className="t-empty">No agents yet. Click <b>Sync from Hunar</b> to import.</div>
         ) : (
           <div className="t-tbl-wrap">
             <table className="t-tbl">
-              <thead><tr><th>Agent</th><th>Code</th><th>Language</th><th>Input Fields</th><th>Qualification Rule</th><th>Status</th><th>Actions</th></tr></thead>
+              <thead><tr><th>Agent</th><th>Code</th><th>Added By</th><th>Language</th><th>Input Fields</th><th>Qualification Rule</th><th>Status</th><th>Actions</th></tr></thead>
               <tbody>
                 {agents.map(a=>{
                   const rules = a.qualificationRules || (a.qualificationField ? [{field: a.qualificationField, keywords: a.qualificationValues||[]}] : []);
@@ -1714,6 +2173,7 @@ function AgentsView({ onChange }) {
                     <tr key={a.agentCode}>
                       <td><div className="t-tbl nm">{a.displayName}</div><div className="t-tbl nm-sub">{a.description?.slice(0,60)}</div></td>
                       <td><span className="t-mono">{a.agentCode}</span></td>
+                      <td><span className="t-mono" style={{fontSize:10,color:"var(--muted)"}}>{a.createdBy||"—"}</span></td>
                       <td style={{fontSize:11}}>{a.language}</td>
                       <td>{(a.customVariables||[]).map(v=><span key={v} className="t-pill t-pill-gray" style={{marginRight:2,marginBottom:2}}>{v}</span>)}</td>
                       <td style={{fontSize:11}}>
@@ -1739,7 +2199,7 @@ function AgentsView({ onChange }) {
             </table>
           </div>
         )}
-      </div>
+      </div>)}
       {editing && <AgentEditModal agent={editing} onSave={save} onClose={()=>setEditing(null)}/>}
     </div>
   );
@@ -1783,7 +2243,7 @@ function AgentEditModal({ agent, onSave, onClose }) {
       <div className="t-modal t-fade" style={{maxWidth:600}}>
         <div className="t-modal-hd"><span>Edit Agent — {agent.displayName||agent.agentCode}</span><button onClick={onClose} style={{background:"none",border:"none",color:"rgba(255,255,255,.6)",cursor:"pointer",fontSize:18,lineHeight:1}}>×</button></div>
         <div className="t-modal-body" style={{display:"flex",flexDirection:"column",gap:12}}>
-          <div style={{fontSize:9,fontFamily:"var(--fm)",color:"var(--muted)"}}>Hunar ID: {agent.agentId}</div>
+          <div style={{fontSize:9,fontFamily:"var(--fm)",color:"var(--muted)"}}>Hunar ID: {agent.agentId} · Added by: {agent.createdBy||"—"}</div>
           <div><label className="t-label">Display Name</label><input className="t-input" value={a.displayName||""} onChange={e=>setA({...a,displayName:e.target.value})}/></div>
           <div><label className="t-label">Description</label><textarea className="t-input" rows={2} value={a.description||""} onChange={e=>setA({...a,description:e.target.value})}/></div>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
@@ -1888,7 +2348,7 @@ function UsersView({ user, teams }) {
 }
 function UserModal({ user, teams, actorRole, actorTeam, onSave, onClose, isNew }) {
   const [u,setU]=useState({...user});
-  const roles=actorRole==="super_admin"?["super_admin","admin","team_lead","recruiter"]:(actorRole==="admin"?["team_lead","recruiter"]:["recruiter"]);
+  const roles=actorRole==="super_admin"?["super_admin","admin","team_lead","individual_contributor","recruiter"]:(actorRole==="admin"?["team_lead","individual_contributor","recruiter"]:["recruiter"]);
   const locked=actorRole==="team_lead";
   return (
     <div className="t-modal-bg">
@@ -1928,13 +2388,15 @@ function TeamsView({ user, agents }) {
         {loading ? <div style={{padding:60,textAlign:"center"}}><Spin/></div> : teams.length===0 ? <div className="t-empty">No teams yet.</div> : (
           <div className="t-tbl-wrap">
             <table className="t-tbl">
-              <thead><tr><th>Team Name</th><th>Admin Email</th><th>Agents Assigned</th><th>Actions</th></tr></thead>
+              <thead><tr><th>Team Name</th><th>Agents Assigned</th><th>Actions</th></tr></thead>
               <tbody>
                 {teams.map(t=>(
                   <tr key={t.id}>
                     <td><div className="t-tbl nm">{t.name}</div></td>
-                    <td><span className="t-mono" style={{fontSize:10}}>{t.adminEmail||"—"}</span></td>
-                    <td>{(t.agentCodes||[]).map(code=>{const a=agents.find(x=>x.agentCode===code);return <span key={code} className="t-pill t-pill-blue" style={{marginRight:3,marginBottom:2}}>{a?a.displayName:code}</span>;})}</td>
+                    <td>{(t.agentCodes||[]).length===0
+                      ? <span style={{fontSize:10,color:"var(--muted)"}}>None assigned</span>
+                      : (t.agentCodes||[]).map(code=>{const a=agents.find(x=>x.agentCode===code);return <span key={code} className="t-pill t-pill-blue" style={{marginRight:3,marginBottom:2}}>{a?a.displayName:code}</span>;})
+                    }</td>
                     <td><button onClick={()=>setEditing(t)} className="t-btn t-btn-outline t-btn-sm">Edit</button></td>
                   </tr>
                 ))}
@@ -1943,7 +2405,7 @@ function TeamsView({ user, agents }) {
           </div>
         )}
       </div>
-      {adding&&<TeamModal team={{name:"",adminEmail:"",agentCodes:[]}} agents={agents} onSave={save} onClose={()=>setAdding(false)} isNew/>}
+      {adding&&<TeamModal team={{name:"",agentCodes:[]}} agents={agents} onSave={save} onClose={()=>setAdding(false)} isNew/>}
       {editing&&<TeamModal team={editing} agents={agents} onSave={save} onClose={()=>setEditing(null)}/>}
     </div>
   );
@@ -1957,16 +2419,17 @@ function TeamModal({ team, agents, onSave, onClose, isNew }) {
         <div className="t-modal-hd"><span>{isNew?"Add Team":"Edit Team"}</span><button onClick={onClose} style={{background:"none",border:"none",color:"rgba(255,255,255,.6)",cursor:"pointer",fontSize:18,lineHeight:1}}>×</button></div>
         <div className="t-modal-body" style={{display:"flex",flexDirection:"column",gap:10}}>
           <div><label className="t-label">Team Name</label><input className="t-input" value={t.name||""} onChange={e=>setT({...t,name:e.target.value})}/></div>
-          <div><label className="t-label">Admin Email (optional)</label><input className="t-input" type="email" value={t.adminEmail||""} onChange={e=>setT({...t,adminEmail:e.target.value})}/></div>
           <div>
-            <label className="t-label">Agents This Team May Run</label>
+            <label className="t-label">Agents This Team May Use</label>
+            <div style={{fontSize:10,color:"var(--muted)",marginBottom:6}}>These agents will be visible to all recruiters in this team.</div>
             <div style={{border:"1.5px solid var(--black)",maxHeight:200,overflowY:"auto"}}>
-              {agents.map(a=>(
+              {(agents||[]).map(a=>(
                 <label key={a.agentCode} style={{display:"flex",alignItems:"center",gap:8,padding:"7px 10px",borderBottom:"1px solid #f0f0f0",cursor:"pointer",fontSize:12}}>
                   <input type="checkbox" style={{width:"auto"}} checked={t.agentCodes.includes(a.agentCode)} onChange={()=>toggleAgent(a.agentCode)}/>
-                  <div style={{flex:1}}><div style={{fontWeight:600,fontSize:12}}>{a.displayName}</div><div style={{fontSize:9,color:"var(--muted)",fontFamily:"var(--fm)"}}>{a.agentCode} · {a.active?"active":"inactive"}</div></div>
+                  <div style={{flex:1}}><div style={{fontWeight:600,fontSize:12}}>{a.displayName||a.agentCode}</div><div style={{fontSize:9,color:"var(--muted)",fontFamily:"var(--fm)"}}>{a.agentCode} · added by {a.createdBy||"unknown"}</div></div>
                 </label>
               ))}
+              {(agents||[]).length===0 && <div style={{padding:"12px 10px",fontSize:11,color:"var(--muted)"}}>No agents available yet.</div>}
             </div>
           </div>
         </div>
@@ -1977,276 +2440,588 @@ function TeamModal({ team, agents, onSave, onClose, isNew }) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// USAGE VIEW — enhanced with team/user stats including QL, connected, lineup, CV awaited, empty status
+// TL/IC AGENTS VIEW — grouped by creator, with "Add by ID" + wizard
 // ─────────────────────────────────────────────────────────────
-function UsageView() {
-  const [data,setData]=useState(null); const [range,setRange]=useState("7d");
-  const [viewMode,setViewMode]=useState("team");
-  const [userFilter,setUserFilter]=useState("");
+const VOICE_PERSONAS = ["NEHA","ROY","ZOE","SAM","MIRA","EESHA"];
+const LANGUAGES      = ["ENGLISH","HINDI","TAMIL","TURKISH","SPANISH","KANNADA","MARATHI","TELUGU"];
 
-  useEffect(()=>{ setData(null); (async()=>{ const r=await api("getUsage",{range}); if(r.ok)setData(r); })(); },[range]);
+function TLAgentsView({ user, agents: initAgents, refreshAgents }) {
+  const [agents, setAgents] = useState(initAgents||[]);
+  const [tab, setTab] = useState("active");
+  const [mode, setMode] = useState("list"); // list | create | edit | addById | qualEdit
+  const [editAgent, setEditAgent] = useState(null);
+  const [search, setSearch] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState({type:"",text:""});
+const [addedAgentForQual, setAddedAgentForQual] = useState(null);
 
-  if(!data) return <div style={{padding:60,textAlign:"center"}}><Spin/></div>;
+  useEffect(()=>setAgents(initAgents||[]),[initAgents]);
 
-  // Chart data
-  const byDay={};
-  (data.rows||[]).forEach(r=>{byDay[r.day]=(byDay[r.day]||0)+Number(r.minutes||0);});
-  const chartData=Object.keys(byDay).sort().map(d=>({day:d,minutes:Math.round(byDay[d]*10)/10}));
+  const [stats, setStats] = useState({});
+  useEffect(()=>{
+    (async()=>{
+      const r = await api("getCampaigns",{});
+      if(!r.ok) return;
+      const s={};
+      (r.campaigns||[]).forEach(c=>{
+        if(!s[c.agentCode]) s[c.agentCode]={campaigns:0,connected:0,total:0};
+        s[c.agentCode].campaigns+=1;
+        s[c.agentCode].connected+=Number(c.connected||0);
+        s[c.agentCode].total+=Number(c.contactsCount||0);
+      });
+      setStats(s);
+    })();
+  },[]);
 
-  // Team grouping with extended stats from leadStats
-  const byTeam={};
-  (data.rows||[]).forEach(r=>{
-    const t=r.team||"No Team";
-    if(!byTeam[t]) byTeam[t]={name:t,totalMins:0,totalCalls:0,rows:[],ql:0,connected:0,lineup:0,cvAwaited:0,emptyStatus:0};
-    byTeam[t].totalMins=Math.round((byTeam[t].totalMins+Number(r.minutes||0))*10)/10;
-    byTeam[t].totalCalls+=Number(r.calls||0);
-    byTeam[t].rows.push(r);
-  });
+  const myAgents   = agents.filter(a => a.createdBy === user.email);
+  const activeList = myAgents.filter(a=>a.active);
+  const draftList  = myAgents.filter(a=>!a.active);
+  const shown = (tab==="active"?activeList:draftList).filter(a=>!search||a.displayName.toLowerCase().includes(search.toLowerCase()));
 
-  // Aggregate lead stats per team
-  (data.leadStats||[]).forEach(ls=>{
-    const t=ls.team||"No Team";
-    if(byTeam[t]){
-      byTeam[t].ql += ls.totalLeads||0;
-      byTeam[t].connected += ls.connected||0;
-      byTeam[t].lineup += ls.interviewLinedUp||0;
-      byTeam[t].cvAwaited += ls.cvAwaited||0;
-      byTeam[t].emptyStatus += ls.emptyCallStatus||0;
+  // For recruiters: agents that were added by TL/IC (not the current user) — read-only
+  const othersAgents = agents.filter(a => a.createdBy !== user.email && a.active);
+
+  async function doSave(form, qualRules) {
+    setSaving(true); setMsg({type:"",text:""});
+    const rules = Object.entries(qualRules).filter(([f])=>f).map(([field,keywords])=>({field,keywords}));
+    const firstField = rules[0]?.field||"";
+    const allKeywords = rules.flatMap(r=>r.keywords);
+    const resultSchema = {};
+    (form.resultFields||[]).filter(f=>f.name.trim()).forEach(f=>{ resultSchema[f.name.trim()]=f.expected.trim()||"string"; });
+    const r = await api("upsertMyAgent",{agent:{
+      agentCode:    editAgent?.agentCode||"",
+      agentId:      editAgent?.agentId||"",
+      displayName:  form.displayName,
+      description:  form.objective,
+      language:     form.language,
+      voicePersona: form.voicePersona,
+      agentPrompt:  form.agentPrompt,
+      resultPrompt: form.resultPrompt,
+      introduction: form.introduction,
+      objective:    form.objective,
+      resultSchema,
+      qualificationRules:  rules,
+      qualificationField:  firstField,
+      qualificationValues: allKeywords,
+      qualificationValue:  allKeywords[0]||"",
+      active: true,
+    }});
+    setSaving(false);
+if(!r.ok){ setMsg({type:"error",text:r.message||r.error}); return; }
+setMsg({type:"success",text:editAgent?"Agent updated!":"Agent created!"});
+    const me = await api("me",{});
+    if(me.ok){ setAgents(me.agents||[]); refreshAgents&&refreshAgents(me.agents||[]); }
+    setTimeout(()=>setMode("list"),1200);
+  }
+
+  async function doAddById(agentId) {
+  if(!agentId.trim()){ setMsg({type:"error",text:"Enter an Agent ID"}); return; }
+  setSaving(true); setMsg({type:"",text:""});
+  try {
+    const r = await api("addAgentById",{agentId:agentId.trim()});
+    if(!r.ok){
+      setMsg({type:"error",text:r.message||r.error||"Failed to add agent."});
+      return;
     }
-  });
-
-  const teamList=Object.values(byTeam).sort((a,b)=>b.totalMins-a.totalMins);
-
-  // Per-user aggregation with extended stats
-  const byUser = {};
-  (data.rows||[]).forEach(r=>{
-    const key = r.email || r.name;
-    if(!byUser[key]) byUser[key]={name:r.name,email:r.email,team:r.team,dailyLimit:r.dailyLimit,totalMins:0,totalCalls:0,days:0,ql:0,connected:0,lineup:0,cvAwaited:0,emptyStatus:0};
-    byUser[key].totalMins=Math.round((byUser[key].totalMins+Number(r.minutes||0))*10)/10;
-    byUser[key].totalCalls+=Number(r.calls||0);
-    byUser[key].days+=1;
-  });
-
-  // Merge leadStats into user
-  (data.leadStats||[]).forEach(ls=>{
-    const key = ls.email;
-    if(byUser[key]){
-      byUser[key].ql = ls.totalLeads||0;
-      byUser[key].connected = ls.connected||0;
-      byUser[key].lineup = ls.interviewLinedUp||0;
-      byUser[key].cvAwaited = ls.cvAwaited||0;
-      byUser[key].emptyStatus = ls.emptyCallStatus||0;
+    const me = await api("me",{});
+    if(me.ok){
+      setAgents(me.agents||[]);
+      refreshAgents&&refreshAgents(me.agents||[]);
+      const newAgent = (me.agents||[]).find(a=>a.agentCode===r.agentCode);
+      if(newAgent) setAddedAgentForQual(newAgent);
     }
-  });
+    setMsg({type:"success",text:"Agent added! Now set qualification rules."});
+  } catch(e) {
+    setMsg({type:"error",text:"Network error: "+e.message});
+  } finally {
+    setSaving(false);
+  }
+}
 
-  const userList = Object.values(byUser).sort((a,b)=>b.totalMins-a.totalMins);
-  const userOptions = userList.map(u=>({label:u.name||u.email, value:u.email}));
-
-  const filteredRows = userFilter
-    ? (data.rows||[]).filter(r=>r.email===userFilter||r.name===userFilter)
-    : (data.rows||[]);
-
-  const grandTotalMins = (data.rows||[]).reduce((s,r)=>s+Number(r.minutes||0),0);
-  const grandTotalCalls = (data.rows||[]).reduce((s,r)=>s+Number(r.calls||0),0);
-  const grandQL = (data.leadStats||[]).reduce((s,ls)=>s+(ls.totalLeads||0),0);
-  const grandConnected = (data.leadStats||[]).reduce((s,ls)=>s+(ls.connected||0),0);
-  const grandLineup = (data.leadStats||[]).reduce((s,ls)=>s+(ls.interviewLinedUp||0),0);
+  if(mode==="create"||mode==="edit") return <TLAgentWizard user={user} editAgent={editAgent} onSave={doSave} onBack={()=>setMode("list")} saving={saving} msg={msg} setMsg={setMsg}/>;
+  if(mode==="qualEdit") return <TLQualEditor agent={editAgent} onBack={()=>setMode("list")} onSaved={async()=>{ const me=await api("me",{}); if(me.ok){setAgents(me.agents||[]);refreshAgents&&refreshAgents(me.agents||[]);} setMode("list"); }}/>;
+  if(mode==="addById") return <TLAddByIdView
+  onBack={()=>{ setMode("list"); setMsg({type:"",text:""}); setAddedAgentForQual(null); }}
+  onAdd={doAddById}
+  saving={saving}
+  msg={msg}
+  addedAgent={addedAgentForQual}
+/>;
 
   return (
     <div className="t-fade">
       <div className="t-mast">
-        <div><div className="t-mast-title">Usage</div><div className="t-mast-sub">Call minute consumption by team &amp; user</div></div>
-        <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-          <div style={{display:"flex",border:"1.5px solid rgba(255,255,255,.3)",borderRadius:3,overflow:"hidden"}}>
-            <button onClick={()=>setViewMode("team")} style={{padding:"5px 12px",fontSize:10,fontFamily:"var(--fd)",fontWeight:700,letterSpacing:".08em",border:"none",cursor:"pointer",background:viewMode==="team"?"#fff":"transparent",color:viewMode==="team"?"var(--black)":"rgba(255,255,255,.7)"}}>By Team</button>
-            <button onClick={()=>setViewMode("user")} style={{padding:"5px 12px",fontSize:10,fontFamily:"var(--fd)",fontWeight:700,letterSpacing:".08em",border:"none",borderLeft:"1px solid rgba(255,255,255,.3)",cursor:"pointer",background:viewMode==="user"?"#fff":"transparent",color:viewMode==="user"?"var(--black)":"rgba(255,255,255,.7)"}}>By User</button>
-          </div>
-          <select className="mast-select" value={range} onChange={e=>setRange(e.target.value)}>
-            <option value="today">Today</option><option value="7d">Last 7 days</option><option value="30d">Last 30 days</option>
-          </select>
+        <div><div className="t-mast-title">Agents</div><div className="t-mast-sub">Your calling agents · {myAgents.length} total</div></div>
+        <div style={{display:"flex",gap:8}}>
+          <button className="t-btn t-btn-outline t-btn-sm" style={{background:"#fff",color:"var(--black)",fontFamily:"var(--fd)",fontWeight:900,fontSize:11,padding:"8px 18px"}} onClick={()=>{ setMode("addById"); setMsg({type:"",text:""}); }}>+ Add by Agent ID</button>
+          <button className="t-btn" style={{background:"#fff",color:"var(--black)",fontFamily:"var(--fd)",fontWeight:900,fontSize:11,padding:"8px 18px"}} onClick={()=>{ setEditAgent(null); setMsg({type:"",text:""}); setMode("create"); }}>+ Create new Agent</button>
         </div>
       </div>
 
-      {/* Grand totals */}
-      <div className="t-kpis" style={{gridTemplateColumns:"repeat(6,1fr)"}}>
-        {[
-          {label:"Total Minutes",value:Math.round(grandTotalMins*10)/10,color:"#ffc600"},
-          {label:"Total Calls",value:grandTotalCalls,color:"#0066b3"},
-          {label:"Active Users",value:userList.length,color:"#009149"},
-          {label:"Total QL",value:grandQL,color:"#009149"},
-          {label:"Connected",value:grandConnected,color:"#0369a1"},
-          {label:"Lined Up",value:grandLineup,color:"#5b21b6"},
-        ].map(k=>(
-          <div key={k.label} className="t-kpi">
-            <div className="t-kpi-accent" style={{background:k.color}}/>
-            <div className="t-kpi-label">{k.label}</div>
-            <div className="t-kpi-value">{k.value}</div>
-          </div>
-        ))}
+      {/* Tabs: My Active / My Inactive */}
+      <div style={{padding:"0 20px 0",display:"flex",alignItems:"center",gap:16,background:"#fff",borderBottom:"1px solid var(--border)"}}>
+        <div style={{display:"flex",gap:4}}>
+          {[{id:"active",label:`My Active (${activeList.length})`},{id:"drafts",label:`Inactive (${draftList.length})`}].map(t=>(
+            <button key={t.id} onClick={()=>setTab(t.id)} style={{padding:"10px 16px",fontFamily:"var(--fd)",fontWeight:700,fontSize:12,border:"none",borderBottom:tab===t.id?"2.5px solid var(--black)":"2.5px solid transparent",background:"none",cursor:"pointer",color:tab===t.id?"var(--black)":"var(--muted)",marginBottom:-1}}>
+              {t.label}
+            </button>
+          ))}
+        </div>
+        <div style={{flex:1}}/>
+        <input className="t-input" style={{width:220,fontSize:12,padding:"6px 10px"}} placeholder="Search by agent name…" value={search} onChange={e=>setSearch(e.target.value)}/>
       </div>
 
-      {chartData.length>0 && RECHARTS_OK && (
-        <div className="t-board">
-          <div className="t-board-hd"><h2 className="t-board-hd-title">Minutes Per Day</h2></div>
-          <div style={{padding:"14px 18px"}}>
-            <R.ResponsiveContainer width="100%" height={180}>
-              <R.BarChart data={chartData}>
-                <R.CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0"/>
-                <R.XAxis dataKey="day" fontSize={10} tick={{fill:"#888",fontFamily:"var(--fm)"}}/>
-                <R.YAxis fontSize={10} tick={{fill:"#888",fontFamily:"var(--fm)"}}/>
-                <R.Tooltip contentStyle={{border:"1.5px solid #0a0a0a",borderRadius:0,fontSize:11}}/>
-                <R.Bar dataKey="minutes" fill="#0a0a0a" radius={[2,2,0,0]}/>
-              </R.BarChart>
-            </R.ResponsiveContainer>
+      {/* MY agents grid */}
+      <div style={{padding:20,display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(320px,1fr))",gap:16}}>
+        {shown.map(agent=>{
+          const st = stats[agent.agentCode]||{};
+          const connRate = st.total>0 ? Math.round((st.connected/st.total)*100) : 0;
+          const qualRuleCount = (agent.qualificationRules||[]).length;
+          return (
+            <div key={agent.agentCode} style={{background:"#fff",border:"1.5px solid var(--border)",borderRadius:12,overflow:"hidden",position:"relative"}}>
+              
+  {!agent.addedById && (
+  <button onClick={()=>{ setEditAgent(agent); setMsg({type:"",text:""}); setMode("edit"); }} style={{position:"absolute",top:12,right:12,background:"#f5f5f5",border:"1px solid #e0e0e0",borderRadius:6,width:30,height:30,display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",fontSize:14}}>✏️</button>
+)}
+              <div style={{padding:"20px 20px 14px"}}>
+                <div style={{width:56,height:56,borderRadius:12,background:`hsl(${agent.agentCode.charCodeAt(0)*37%360},60%,55%)`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:24,marginBottom:12}}>🎙️</div>
+                <div style={{fontFamily:"var(--fd)",fontWeight:900,fontSize:16,marginBottom:2}}>{agent.displayName}</div>
+                <div style={{fontSize:11,color:"var(--muted)",fontFamily:"var(--fm)",marginBottom:8}}>{agent.voicePersona||"—"}, {agent.language} · <span style={{fontFamily:"var(--fm)",color:"#888"}}>{agent.agentCode}</span></div>
+                <div style={{fontSize:11,color:"var(--muted)",lineHeight:1.5,display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical",overflow:"hidden"}}>{agent.description||"No description."}</div>
+              </div>
+              <div style={{borderTop:"1px solid #f0f0f0",padding:"10px 20px",display:"flex",gap:16,alignItems:"center"}}>
+                <div style={{display:"flex",alignItems:"center",gap:5,fontSize:11,color:"var(--muted)"}}>
+                  <span style={{fontSize:14}}>📋</span><span><b style={{color:"var(--black)"}}>{st.campaigns||0}</b> Campaigns</span>
+                </div>
+                <div style={{display:"flex",alignItems:"center",gap:5,fontSize:11,color:"var(--muted)"}}>
+                  <span style={{fontSize:14}}>📡</span><span><b style={{color:"var(--black)"}}>{connRate}%</b> Connection rate</span>
+                </div>
+              </div>
+              <div style={{borderTop:"1px solid #f0f0f0",padding:"10px 20px",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+                <div style={{fontSize:11,color:"var(--muted)"}}>
+                  {qualRuleCount>0
+                    ? <span style={{color:"var(--green)",fontWeight:700}}>✓ {qualRuleCount} qual rule{qualRuleCount>1?"s":""}</span>
+                    : <span style={{color:"var(--red)"}}>⚠ No qualification rules</span>
+                  }
+                </div>
+                <button className="t-btn t-btn-outline t-btn-sm" onClick={()=>{ setEditAgent(agent); setMode("qualEdit"); }}>Edit Rules</button>
+              </div>
+            </div>
+          );
+        })}
+        {shown.length===0 && (
+          <div style={{gridColumn:"1/-1",padding:"48px 0",textAlign:"center"}}>
+            <div style={{fontSize:40,marginBottom:12}}>🤖</div>
+            <div style={{fontFamily:"var(--fd)",fontWeight:900,fontSize:16,marginBottom:8}}>
+              {tab==="active"?"No active agents":"No inactive agents"}
+            </div>
+            <div style={{fontSize:12,color:"var(--muted)",marginBottom:20}}>Create a new agent or add one by Agent ID</div>
+            <button className="t-btn t-btn-black" onClick={()=>{ setEditAgent(null); setMsg({type:"",text:""}); setMode("create"); }}>+ Create new Agent</button>
+          </div>
+        )}
+      </div>
+
+      {/* Agents visible to recruiters (added by TL/IC on team) — only show for TL context */}
+      {othersAgents.length > 0 && (
+        <div style={{borderTop:"2px solid var(--black)"}}>
+          <div className="agent-group-hd">
+            <span>Added through Agent ID</span>
+            <span style={{fontWeight:400,color:"var(--muted)",fontSize:9}}>{othersAgents.length} agent{othersAgents.length!==1?"s":""} linked by other TL/ICs on your team</span>
+          </div>
+          <div style={{padding:"12px 20px",display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))",gap:12}}>
+            {othersAgents.map(agent=>(
+              <div key={agent.agentCode} style={{background:"#fafafa",border:"1.5px solid #e0e0e0",borderRadius:8,padding:14}}>
+                <div style={{fontFamily:"var(--fd)",fontWeight:700,fontSize:13,marginBottom:2,color:"var(--black)"}}>{agent.displayName}</div>
+                <div style={{fontSize:10,color:"var(--black)",fontFamily:"var(--fm)",marginBottom:4}}>{agent.agentCode}</div>
+                <div style={{fontSize:10,color:"var(--muted)"}}>Added by: <span style={{fontWeight:600,color:"var(--black)"}}>{agent.createdBy}</span></div>
+                <div style={{marginTop:6,fontSize:10,color:"var(--muted)"}}>Recruiters on your team can use this agent</div>
+              </div>
+            ))}
           </div>
         </div>
       )}
+    </div>
+  );
+}
 
-      {viewMode==="team" ? (
-        <div className="t-board">
-          <div className="t-board-hd"><h2 className="t-board-hd-title">By Team</h2><span className="t-board-meta">{teamList.length} teams</span></div>
-          {teamList.map(team=>(
-            <div key={team.name} className="usage-team-card">
-              <div className="usage-team-card-hd">
-                <span>{team.name}</span>
-                <span className="usage-team-stat">{team.totalCalls} calls</span>
-                <span className="usage-team-stat">{team.totalMins} min</span>
-              </div>
-              {/* Team KPI chips */}
-              <div style={{padding:"10px 16px",display:"flex",gap:8,flexWrap:"wrap",borderBottom:"1px solid var(--border)"}}>
-                <span className="usage-stat-chip blue"><b>{team.totalCalls}</b><span>calls</span></span>
-                <span className="usage-stat-chip yellow"><b>{team.totalMins}</b><span>min</span></span>
-                <span className="usage-stat-chip green"><b>{team.ql}</b><span>QL</span></span>
-                <span className="usage-stat-chip blue"><b>{team.connected}</b><span>connected</span></span>
-                <span className="usage-stat-chip purple"><b>{team.lineup}</b><span>lined up</span></span>
-                <span className="usage-stat-chip yellow"><b>{team.cvAwaited}</b><span>CV awaited</span></span>
-                {team.emptyStatus>0 && <span className="usage-stat-chip red"><b>{team.emptyStatus}</b><span>empty status</span></span>}
-              </div>
-              <div className="t-tbl-wrap">
-                <table className="t-tbl">
-                  <thead><tr><th>Day</th><th>User</th><th>Calls</th><th>Minutes</th><th>Daily Limit</th><th>Usage</th></tr></thead>
-                  <tbody>
-                    {team.rows.map((r,i)=>{
-                      const pct = r.dailyLimit>0 ? Math.min(100,Math.round((Number(r.minutes)/r.dailyLimit)*100)) : 0;
-                      return (
-                        <tr key={i}>
-                          <td><span className="t-mono" style={{fontSize:10}}>{r.day}</span></td>
-                          <td><div className="t-tbl nm">{r.name}</div><div className="t-tbl nm-sub">{r.email}</div></td>
-                          <td className="t-mono">{r.calls}</td>
-                          <td className="t-mono">{r.minutes}</td>
-                          <td className="t-mono">{r.dailyLimit}</td>
-                          <td style={{minWidth:80}}>
-                            <div style={{display:"flex",alignItems:"center",gap:6}}>
-                              <div className="t-bar" style={{flex:1,height:5,borderRadius:3}}>
-                                <div style={{width:pct+"%",borderRadius:3,height:"100%",background:pct>=90?"var(--red)":pct>=60?"var(--yellow)":"var(--green)"}}/>
-                              </div>
-                              <span style={{fontSize:9,fontFamily:"var(--fm)",color:"var(--muted)",minWidth:26}}>{pct}%</span>
-                            </div>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <div className="t-board">
-          <div className="t-board-hd">
-            <h2 className="t-board-hd-title">Per User</h2>
-            <div style={{display:"flex",gap:8,alignItems:"center"}}>
-              <select className="t-select" value={userFilter} onChange={e=>setUserFilter(e.target.value)} style={{fontSize:11,minWidth:180}}>
-                <option value="">All users</option>
-                {userOptions.map(u=><option key={u.value} value={u.value}>{u.label}</option>)}
-              </select>
-              {userFilter && <button className="t-btn t-btn-sm t-btn-outline" onClick={()=>setUserFilter("")}>Clear ×</button>}
-              <span className="t-board-meta">{userFilter ? "1 user" : `${userList.length} users`}</span>
-            </div>
-          </div>
+// ── TL Qual Editor (standalone) ──
+function TLQualEditor({ agent, onBack, onSaved }) {
+  const resultFields = useMemo(()=>{
+    const s=agent?.resultSchema||{};
+    if(s.properties) return Object.keys(s.properties);
+    return Object.keys(s).filter(k=>k!=="type"&&k!=="required");
+  },[agent]);
 
-          {/* Per-user summary cards with extended stats */}
-          {!userFilter && (
-            <div style={{padding:"12px 16px",display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))",gap:10,borderBottom:"1px solid var(--border)"}}>
-              {userList.map(u=>{
-                const avgMins = u.days>0 ? Math.round((u.totalMins/u.days)*10)/10 : 0;
-                const limitPct = u.dailyLimit>0 ? Math.min(100,Math.round((avgMins/u.dailyLimit)*100)) : 0;
+  const [qualRules, setQualRules] = useState(()=>{
+    const rules={};
+    if(agent?.qualificationRules?.length){ agent.qualificationRules.forEach(r=>{ if(r.field) rules[r.field]=r.keywords||[]; }); }
+    else if(agent?.qualificationField){ rules[agent.qualificationField]=agent.qualificationValues||[]; }
+    return rules;
+  });
+  const [kwInputs,setKwInputs]=useState({});
+  const [saving,setSaving]=useState(false);
+  const [msg,setMsg]=useState({type:"",text:""});
+
+  function toggleField(f){ setQualRules(p=>{ const n={...p}; if(n[f]!==undefined)delete n[f]; else n[f]=[]; return n; }); }
+  function addKw(f){ const kw=(kwInputs[f]||"").trim(); if(!kw)return; setQualRules(p=>({...p,[f]:[...(p[f]||[]),kw]})); setKwInputs(p=>({...p,[f]:""})); }
+  function removeKw(f,kw){ setQualRules(p=>({...p,[f]:(p[f]||[]).filter(k=>k!==kw)})); }
+
+  async function save(){
+    setSaving(true); setMsg({type:"",text:""});
+    const rules=Object.entries(qualRules).filter(([f])=>f).map(([field,keywords])=>({field,keywords}));
+    const r=await api("upsertMyAgent",{agent:{...agent,qualificationRules:rules,qualificationField:rules[0]?.field||"",qualificationValues:rules.flatMap(r=>r.keywords),qualificationValue:rules.flatMap(r=>r.keywords)[0]||""}});
+    setSaving(false);
+    if(!r.ok){ setMsg({type:"error",text:r.message||r.error}); return; }
+setMsg({type:"success",text:"Rules saved!"}); setTimeout(onSaved,900);
+  }
+
+  return (
+    <div className="t-fade">
+      <div style={{background:"#fff",borderBottom:"1.5px solid #eee",padding:"12px 24px",display:"flex",alignItems:"center",gap:12}}>
+        <button style={{background:"none",border:"none",cursor:"pointer",fontFamily:"var(--fd)",fontWeight:700,fontSize:12}} onClick={onBack}>← Back</button>
+        <span style={{fontFamily:"var(--fd)",fontWeight:900,fontSize:14}}>Qualification Rules — {agent?.displayName}</span>
+      </div>
+      <div style={{padding:24,maxWidth:600}}>
+        {resultFields.length===0
+          ? <Alert type="info">No result schema fields defined. Edit the agent first to add result fields.</Alert>
+          : (
+            <>
+              <div style={{marginBottom:16}}>
+                <label className="t-label" style={{marginBottom:8}}>Select fields that determine a qualified lead:</label>
+                <div style={{border:"1.5px solid var(--black)",background:"#fff"}}>
+                  {resultFields.map(f=>{
+                    const isSel=qualRules[f]!==undefined;
+                    return (
+                      <label key={f} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",borderBottom:"1px solid #f5f5f5",cursor:"pointer",background:isSel?"#f0f5ff":"transparent"}}>
+                        <input type="checkbox" checked={isSel} onChange={()=>toggleField(f)} style={{width:14,height:14}}/>
+                        <span style={{flex:1,fontFamily:"var(--fm)",fontSize:13}}>{f}</span>
+                        {isSel && <span style={{fontSize:9,fontFamily:"var(--fd)",fontWeight:700,color:"var(--blue)",letterSpacing:".08em"}}>ACTIVE</span>}
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+              {Object.keys(qualRules).map(field=>{
+                const kws=qualRules[field]||[];
                 return (
-                  <div key={u.email} className="usage-user-card" onClick={()=>setUserFilter(u.email)}>
-                    <div className="usage-user-hd">
-                      <Disc name={u.name||u.email}/>
-                      <div style={{flex:1,minWidth:0}}>
-                        <div className="usage-user-name">{u.name||u.email}</div>
-                        <div className="usage-user-email">{u.email} · {u.team||"No team"}</div>
-                      </div>
+                  <div key={field} style={{border:"1.5px solid #0066b3",padding:"12px 14px",marginBottom:12,background:"#f0f8ff"}}>
+                    <div style={{fontFamily:"var(--fm)",fontSize:13,fontWeight:700,color:"var(--blue)",marginBottom:6}}>{field}</div>
+                    <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:8}}>
+                      {kws.map(kw=><span key={kw} className="t-kwtag">~{kw}<button className="t-kwtag-rm" onClick={()=>removeKw(field,kw)}>×</button></span>)}
+                      {kws.length===0 && <span style={{fontSize:11,color:"var(--muted)",fontStyle:"italic"}}>Any non-empty value qualifies</span>}
                     </div>
-                    {/* Stats chips */}
-                    <div style={{padding:"8px 14px",display:"flex",gap:6,flexWrap:"wrap"}}>
-                      <span className="usage-stat-chip blue"><b>{u.totalCalls}</b><span>calls</span></span>
-                      <span className="usage-stat-chip yellow"><b>{u.totalMins}</b><span>min</span></span>
-                      <span className="usage-stat-chip green"><b>{u.ql}</b><span>QL</span></span>
-                      <span className="usage-stat-chip blue"><b>{u.connected}</b><span>conn</span></span>
-                      <span className="usage-stat-chip purple"><b>{u.lineup}</b><span>lineup</span></span>
-                      <span className="usage-stat-chip yellow"><b>{u.cvAwaited}</b><span>CV</span></span>
-                      {u.emptyStatus>0 && <span className="usage-stat-chip red"><b>{u.emptyStatus}</b><span>empty</span></span>}
+                    <div style={{display:"flex",gap:6}}>
+                      <input className="t-input" style={{flex:1,fontSize:12,padding:"6px 10px"}} value={kwInputs[field]||""} placeholder="Add keyword…" onChange={e=>setKwInputs(p=>({...p,[field]:e.target.value}))} onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();addKw(field);}}}/>
+                      <button className="t-btn t-btn-black t-btn-sm" onClick={()=>addKw(field)}>+ Add</button>
                     </div>
-                    {u.dailyLimit>0 && (
-                      <div style={{padding:"0 14px 10px"}}>
-                        <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"var(--muted)",fontFamily:"var(--fm)",marginBottom:3}}>
-                          <span>Avg vs limit ({u.dailyLimit}m)</span>
-                          <span style={{color:limitPct>=90?"var(--red)":limitPct>=60?"var(--yellow)":"var(--green)",fontWeight:700}}>{limitPct}%</span>
-                        </div>
-                        <div className="t-bar" style={{height:5,borderRadius:3}}>
-                          <div style={{width:limitPct+"%",height:"100%",borderRadius:3,background:limitPct>=90?"var(--red)":limitPct>=60?"var(--yellow)":"var(--green)"}}/>
-                        </div>
-                      </div>
-                    )}
                   </div>
                 );
               })}
-            </div>
-          )}
+            </>
+          )
+        }
+        {msg.text && <div style={{marginBottom:12}}><Alert type={msg.type==="error"?"error":"success"}>{msg.text}</Alert></div>}
+        <div style={{display:"flex",gap:10}}>
+          <button className="t-btn t-btn-outline" onClick={onBack}>Cancel</button>
+          <button className="t-btn t-btn-black" disabled={saving} onClick={save}>{saving?<Spin/>:"Save Rules"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
-          {/* Detailed rows table */}
-          <div className="t-tbl-wrap">
-            <table className="t-tbl">
-              <thead><tr><th>Day</th><th>User</th><th>Team</th><th>Calls</th><th>Minutes</th><th>QL</th><th>Connected</th><th>Lined Up</th><th>CV Awaited</th><th style={{color:"var(--red)"}}>Empty Status</th><th>Limit</th><th>Usage %</th></tr></thead>
-              <tbody>
-                {filteredRows.map((r,i)=>{
-                  const pct = r.dailyLimit>0 ? Math.min(100,Math.round((Number(r.minutes)/r.dailyLimit)*100)) : 0;
-                  // find lead stats for this user
-                  const ls = (data.leadStats||[]).find(x=>x.email===r.email)||{};
-                  return (
-                    <tr key={i}>
-                      <td><span className="t-mono" style={{fontSize:10}}>{r.day}</span></td>
-                      <td><div className="t-tbl nm">{r.name}</div><div className="t-tbl nm-sub">{r.email}</div></td>
-                      <td style={{fontSize:11}}>{r.team||"—"}</td>
-                      <td className="t-mono">{r.calls}</td>
-                      <td className="t-mono">{r.minutes}</td>
-                      <td><span className="usage-stat-chip green" style={{fontSize:10}}><b>{ls.totalLeads||0}</b></span></td>
-                      <td><span className="usage-stat-chip blue" style={{fontSize:10}}><b>{ls.connected||0}</b></span></td>
-                      <td><span className="usage-stat-chip purple" style={{fontSize:10}}><b>{ls.interviewLinedUp||0}</b></span></td>
-                      <td><span className="usage-stat-chip yellow" style={{fontSize:10}}><b>{ls.cvAwaited||0}</b></span></td>
-                      <td>{(ls.emptyCallStatus||0)>0 ? <span className="usage-stat-chip red" style={{fontSize:10}}><b>{ls.emptyCallStatus}</b></span> : <span style={{color:"var(--green)",fontSize:11}}>✓</span>}</td>
-                      <td className="t-mono">{r.dailyLimit}</td>
-                      <td style={{minWidth:90}}>
-                        <div style={{display:"flex",alignItems:"center",gap:6}}>
-                          <div className="t-bar" style={{flex:1,height:5,borderRadius:3}}>
-                            <div style={{width:pct+"%",height:"100%",borderRadius:3,background:pct>=90?"var(--red)":pct>=60?"var(--yellow)":"var(--green)"}}/>
-                          </div>
-                          <span style={{fontSize:9,fontFamily:"var(--fm)",color:pct>=90?"var(--red)":pct>=60?"#854d0e":"var(--green)",fontWeight:700,minWidth:26}}>{pct}%</span>
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-                {filteredRows.length===0 && <tr><td colSpan={12} style={{textAlign:"center",color:"var(--muted)",padding:32,fontFamily:"var(--fd)",fontWeight:700}}>No usage data.</td></tr>}
-              </tbody>
-            </table>
+// ── Add by Agent ID ──
+function TLAddByIdView({ onBack, onAdd, saving, msg, addedAgent }) {
+  const [agentId, setAgentId] = useState("");
+  const [qualRules, setQualRules] = useState({});
+  const [kwInputs, setKwInputs] = useState({});
+  const [savingQual, setSavingQual] = useState(false);
+  const [qualMsg, setQualMsg] = useState({type:"",text:""});
+
+  const isValidUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(agentId.trim());
+
+  const resultFields = useMemo(()=>{
+    const s = addedAgent?.resultSchema||{};
+    if(s.properties) return Object.keys(s.properties);
+    return Object.keys(s).filter(k=>k!=="type"&&k!=="required");
+  },[addedAgent]);
+
+  function toggleQF(f){ setQualRules(p=>{ const n={...p}; if(n[f]!==undefined)delete n[f]; else n[f]=[]; return n; }); }
+  function addKw(f){ const kw=(kwInputs[f]||"").trim(); if(!kw)return; setQualRules(p=>({...p,[f]:[...(p[f]||[]),kw]})); setKwInputs(p=>({...p,[f]:""})); }
+  function rmKw(f,kw){ setQualRules(p=>({...p,[f]:(p[f]||[]).filter(k=>k!==kw)})); }
+
+  async function saveQualRules(){
+    if(!addedAgent) return;
+    setSavingQual(true); setQualMsg({type:"",text:""});
+    const rules = Object.entries(qualRules).filter(([f])=>f).map(([field,keywords])=>({field,keywords}));
+    const r = await api("upsertMyAgent",{agent:{
+      ...addedAgent,
+      qualificationRules: rules,
+      qualificationField: rules[0]?.field||"",
+      qualificationValues: rules.flatMap(r=>r.keywords),
+      qualificationValue: rules.flatMap(r=>r.keywords)[0]||"",
+    }});
+    setSavingQual(false);
+    if(!r.ok){ setQualMsg({type:"error",text:r.message||r.error}); return; }
+    setQualMsg({type:"success",text:"Rules saved!"});
+    setTimeout(onBack, 900);
+  }
+
+  // ── Step 1: Enter Agent ID ──
+  if(!addedAgent) return (
+    <div className="t-fade">
+      <div style={{background:"#fff",borderBottom:"1.5px solid #eee",padding:"12px 24px",display:"flex",alignItems:"center",gap:12}}>
+        <button style={{background:"none",border:"none",cursor:"pointer",fontFamily:"var(--fd)",fontWeight:700,fontSize:12}} onClick={onBack}>← Back</button>
+        <span style={{fontFamily:"var(--fd)",fontWeight:900,fontSize:14}}>Add Existing Agent by ID</span>
+      </div>
+      <div style={{padding:32,maxWidth:480}}>
+        <p style={{fontSize:13,color:"var(--muted)",lineHeight:1.7,marginBottom:24}}>
+          If an agent has already been created in the Hunar platform, you can add it to your list by entering its Agent ID below.
+        </p>
+        <div style={{marginBottom:8}}>
+          <label className="t-label" style={{marginBottom:6}}>Hunar Agent ID <span style={{color:"var(--red)"}}>*</span></label>
+          <input className="t-input" style={{fontSize:13,padding:"10px 12px",fontFamily:"var(--fm)",borderColor:agentId&&!isValidUUID?"var(--red)":"var(--border)"}} placeholder="e.g. 3f2504e0-4f89-11d3-9a0c-0305e82c3301" value={agentId} onChange={e=>setAgentId(e.target.value)}/>
+          <div style={{fontSize:10,marginTop:4,color:agentId&&!isValidUUID?"var(--red)":"var(--muted)"}}>
+            {agentId&&!isValidUUID?"⚠ Must be UUID format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx":"Find this in the Hunar dashboard under agent settings."}
           </div>
         </div>
-      )}
+        {msg.text && <div style={{marginBottom:12}}><Alert type={msg.type==="error"?"error":msg.type==="success"?"success":"info"}>{msg.text}</Alert></div>}
+        <div style={{display:"flex",gap:10,marginTop:16}}>
+          <button className="t-btn t-btn-outline" onClick={onBack}>Cancel</button>
+          <button className="t-btn t-btn-black" disabled={saving||!isValidUUID} onClick={()=>onAdd(agentId)}>{saving?<Spin/>:"Add Agent"}</button>
+        </div>
+      </div>
+    </div>
+  );
+
+  // ── Step 2: Set qual rules ──
+  return (
+    <div className="t-fade">
+      <div style={{background:"#fff",borderBottom:"1.5px solid #eee",padding:"12px 24px",display:"flex",alignItems:"center",gap:12}}>
+        <span style={{fontFamily:"var(--fd)",fontWeight:900,fontSize:14}}>Set Qualification Rules — {addedAgent.displayName}</span>
+        <span style={{background:"var(--green)",color:"#fff",fontSize:9,fontFamily:"var(--fd)",fontWeight:700,padding:"2px 8px"}}>ADDED ✓</span>
+      </div>
+      <div style={{padding:28,maxWidth:560}}>
+        <div style={{background:"#f0fff7",border:"1.5px solid #6ee7b7",padding:"10px 14px",marginBottom:20,fontSize:12,color:"#065f46"}}>
+          ✓ Agent added! Set qualification rules below, or skip and set them later via "Edit Rules".
+        </div>
+        {resultFields.length===0
+          ? <Alert type="info">No result schema fields on this agent. You can set rules later via Edit Rules.</Alert>
+          : (
+            <>
+              <label className="t-label" style={{marginBottom:8}}>Select fields that mark a lead as qualified:</label>
+              <div style={{border:"1.5px solid var(--black)",marginBottom:14}}>
+                {resultFields.map(f=>{
+                  const isSel=qualRules[f]!==undefined;
+                  return (
+                    <label key={f} style={{display:"flex",alignItems:"center",gap:10,padding:"9px 12px",borderBottom:"1px solid #f5f5f5",cursor:"pointer",background:isSel?"#f0f5ff":"transparent"}}>
+                      <input type="checkbox" checked={isSel} onChange={()=>toggleQF(f)} style={{width:13,height:13}}/>
+                      <span style={{flex:1,fontFamily:"var(--fm)",fontSize:12}}>{f}</span>
+                      {isSel&&<span style={{fontSize:9,color:"var(--blue)",fontFamily:"var(--fd)",fontWeight:700}}>ACTIVE</span>}
+                    </label>
+                  );
+                })}
+              </div>
+              {Object.keys(qualRules).map(field=>{
+                const kws=qualRules[field]||[];
+                return (
+                  <div key={field} style={{border:"1.5px solid #0066b3",padding:"11px 13px",marginBottom:10,background:"#f0f8ff"}}>
+                    <div style={{fontFamily:"var(--fm)",fontSize:12,fontWeight:700,color:"var(--blue)",marginBottom:6}}>{field}</div>
+                    <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:7}}>
+                      {kws.map(kw=><span key={kw} className="t-kwtag">~{kw}<button className="t-kwtag-rm" onClick={()=>rmKw(field,kw)}>×</button></span>)}
+                      {kws.length===0&&<span style={{fontSize:10,color:"var(--muted)",fontStyle:"italic"}}>Any non-empty value qualifies</span>}
+                    </div>
+                    <div style={{display:"flex",gap:6}}>
+                      <input className="t-input" style={{flex:1,fontSize:11,padding:"5px 8px"}} value={kwInputs[field]||""} placeholder="Add keyword (e.g. yes, interested)…" onChange={e=>setKwInputs(p=>({...p,[field]:e.target.value}))} onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();addKw(field);}}}/>
+                      <button className="t-btn t-btn-black t-btn-sm" onClick={()=>addKw(field)}>+ Add</button>
+                    </div>
+                  </div>
+                );
+              })}
+            </>
+          )
+        }
+        {qualMsg.text && <div style={{marginBottom:12}}><Alert type={qualMsg.type==="error"?"error":"success"}>{qualMsg.text}</Alert></div>}
+        <div style={{display:"flex",gap:10,marginTop:16}}>
+          <button className="t-btn t-btn-outline" onClick={onBack}>Skip for now</button>
+          <button className="t-btn t-btn-black" disabled={savingQual} onClick={saveQualRules}>{savingQual?<Spin/>:"Save Rules & Finish"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Full agent wizard for TL/IC ──
+function TLAgentWizard({ user, editAgent, onSave, onBack, saving, msg, setMsg }) {
+  const [step, setStep] = useState(1);
+  const STEPS = ["Persona Details","Call Agent","Result Agent","Qualification"];
+
+  const initForm = ()=> editAgent ? {
+    displayName: editAgent.displayName||"",
+    language: editAgent.language||"ENGLISH",
+    voicePersona: editAgent.voicePersona||"NEHA",
+    objective: editAgent.description||"",
+    introduction: editAgent.introduction||"{greeting}, Am I speaking to {callee_name}?",
+    agentPrompt: editAgent.agentPrompt||"",
+    resultPrompt: editAgent.resultPrompt||"",
+    resultFields: (()=>{ const s=editAgent.resultSchema||{}; const keys=s.properties?Object.keys(s.properties):Object.keys(s).filter(k=>k!=="type"&&k!=="required"); return keys.map(k=>({name:k,expected:s.properties?s.properties[k]?.description||"":s[k]||""})); })(),
+  } : {displayName:"",language:"ENGLISH",voicePersona:"NEHA",objective:"",introduction:"{greeting}, Am I speaking to {callee_name}?",agentPrompt:"",resultPrompt:"",resultFields:[]};
+
+  const [form, setForm] = useState(initForm);
+
+  const initQR = ()=>{
+    if(!editAgent) return {};
+    const rules={};
+    if(editAgent.qualificationRules?.length){ editAgent.qualificationRules.forEach(r=>{ if(r.field) rules[r.field]=r.keywords||[]; }); }
+    else if(editAgent.qualificationField){ rules[editAgent.qualificationField]=editAgent.qualificationValues||[]; }
+    return rules;
+  };
+  const [qualRules,setQualRules]=useState(initQR);
+  const [kwInputs,setKwInputs]=useState({});
+
+  function toggleQF(f){ setQualRules(p=>{ const n={...p}; if(n[f]!==undefined)delete n[f]; else n[f]=[]; return n; }); }
+  function addKw2(f){ const kw=(kwInputs[f]||"").trim(); if(!kw)return; setQualRules(p=>({...p,[f]:[...(p[f]||[]),kw]})); setKwInputs(p=>({...p,[f]:""})); }
+  function rmKw(f,kw){ setQualRules(p=>({...p,[f]:(p[f]||[]).filter(k=>k!==kw)})); }
+  function addRF(){ setForm(f=>({...f,resultFields:[...f.resultFields,{name:"",expected:""}]})); }
+  function updateRF(i,k,v){ setForm(f=>{ const rf=[...f.resultFields]; rf[i]={...rf[i],[k]:v}; return{...f,resultFields:rf}; }); }
+  function removeRF(i){ setForm(f=>({...f,resultFields:f.resultFields.filter((_,j)=>j!==i)})); }
+
+  const definedFields = form.resultFields.filter(f=>f.name.trim()).map(f=>f.name.trim());
+
+  function Preview() {
+    return (
+      <div style={{width:220,borderLeft:"1.5px solid #eee",padding:"24px 18px",flexShrink:0,background:"#fafafa"}}>
+        <div style={{fontFamily:"var(--fd)",fontWeight:700,fontSize:10,color:"var(--muted)",letterSpacing:".18em",textTransform:"uppercase",marginBottom:16}}>Preview</div>
+        <div style={{fontFamily:"var(--fd)",fontWeight:900,fontSize:18,marginBottom:14,wordBreak:"break-word"}}>{form.displayName||<span style={{color:"#ccc"}}>Agent Name</span>}</div>
+        <div style={{fontSize:11,color:"var(--muted)",marginBottom:8}}><b>Language:</b> {form.language||"—"}</div>
+        <div style={{fontSize:11,color:"var(--muted)",marginBottom:8}}><b>Persona:</b> <span style={{display:"inline-flex",alignItems:"center",gap:4,background:"#efefef",padding:"2px 8px",borderRadius:4,fontWeight:700}}>{form.voicePersona||"—"} ▷</span></div>
+        {definedFields.length>0 && <div style={{marginTop:10}}><div style={{fontFamily:"var(--fd)",fontWeight:700,fontSize:9,color:"var(--muted)",letterSpacing:".12em",marginBottom:4}}>RESULT FIELDS</div>{definedFields.map(f=><div key={f} style={{fontFamily:"var(--fm)",fontSize:10,color:"#1a6fdc",marginBottom:2}}>{f}</div>)}</div>}
+        {Object.keys(qualRules).length>0 && <div style={{marginTop:10}}><div style={{fontFamily:"var(--fd)",fontWeight:700,fontSize:9,color:"var(--muted)",letterSpacing:".12em",marginBottom:4}}>QUAL RULES</div>{Object.entries(qualRules).map(([f,kws])=><div key={f} style={{fontSize:10,marginBottom:2}}><span style={{color:"var(--blue)",fontWeight:700}}>{f}</span>{kws.length>0&&kws.map(kw=><span key={kw} style={{fontSize:8,background:"#dbeafe",color:"#1e40af",padding:"1px 4px",borderRadius:2,marginLeft:3}}>{kw}</span>)}</div>)}</div>}
+        <div style={{marginTop:14}}><div style={{fontFamily:"var(--fd)",fontWeight:700,fontSize:9,color:"var(--muted)",letterSpacing:".12em",marginBottom:4}}>PRESET VARS</div>{["{greeting}","{persona_name}","{callee_name}","{mobile_number}"].map(v=><div key={v} style={{fontFamily:"var(--fm)",fontSize:10,color:"#6739b7",marginBottom:1}}>{v}</div>)}</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="t-fade" style={{display:"flex",flexDirection:"column",height:"calc(100vh - 48px)",overflow:"hidden"}}>
+      <div style={{background:"#fff",borderBottom:"1.5px solid #eee",padding:"12px 24px",display:"flex",alignItems:"center",gap:12,flexShrink:0}}>
+        <button style={{background:"none",border:"none",cursor:"pointer",fontFamily:"var(--fd)",fontWeight:700,fontSize:12,color:"var(--black)"}} onClick={onBack}>← Back</button>
+        <span style={{fontFamily:"var(--fd)",fontWeight:900,fontSize:14}}>{editAgent?"Edit Agent":"Create New Agent"}</span>
+      </div>
+      <div style={{display:"flex",alignItems:"center",padding:"18px 32px",borderBottom:"1px solid #eee",background:"#fff",flexShrink:0}}>
+        {STEPS.map((label,i)=>{
+          const s=i+1,done=step>s,active=step===s;
+          return (
+            <React.Fragment key={s}>
+              <div style={{display:"flex",alignItems:"center",gap:8,cursor:done?"pointer":"default",opacity:s>step+1?.4:1}} onClick={()=>done&&setStep(s)}>
+                <div style={{width:22,height:22,borderRadius:"50%",border:"2px solid",flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",borderColor:active?"var(--black)":done?"var(--green)":"#ccc",background:done?"var(--green)":active?"var(--black)":"transparent"}}>
+                  {done?<span style={{color:"#fff",fontSize:10}}>✓</span>:<div style={{width:7,height:7,borderRadius:"50%",background:active?"#fff":"transparent"}}/>}
+                </div>
+                <span style={{fontFamily:"var(--fd)",fontWeight:700,fontSize:11,whiteSpace:"nowrap",color:active?"var(--black)":done?"var(--green)":"#aaa"}}>{label}</span>
+              </div>
+              {i<STEPS.length-1&&<div style={{flex:1,height:1.5,margin:"0 12px",minWidth:24,background:done?"var(--green)":"#ddd"}}/>}
+            </React.Fragment>
+          );
+        })}
+      </div>
+      <div style={{flex:1,overflowY:"auto",background:"#fff"}}>
+        {/* Step 1 */}
+        {step===1 && (
+          <div style={{padding:"28px 32px",maxWidth:520}}>
+            <h2 style={{fontFamily:"var(--fd)",fontWeight:900,fontSize:20,marginBottom:24}}>Persona Details</h2>
+            <div style={{marginBottom:16}}><label className="t-label" style={{marginBottom:5}}>Agent name <span style={{color:"var(--red)"}}>*</span></label><input className="t-input" style={{fontSize:13}} placeholder="e.g. Hiring Outreach Agent" value={form.displayName} onChange={e=>setForm({...form,displayName:e.target.value})}/></div>
+            <div style={{marginBottom:16}}><label className="t-label" style={{marginBottom:5}}>Language <span style={{color:"var(--red)"}}>*</span></label><select className="t-select" style={{width:"100%",fontSize:13}} value={form.language} onChange={e=>setForm({...form,language:e.target.value})}><option value="">Select…</option>{LANGUAGES.map(l=><option key={l} value={l}>{l.charAt(0)+l.slice(1).toLowerCase()}</option>)}</select></div>
+            <div style={{marginBottom:28}}><label className="t-label" style={{marginBottom:8}}>Voice Persona <span style={{color:"var(--red)"}}>*</span></label><div style={{display:"flex",gap:8,flexWrap:"wrap"}}>{VOICE_PERSONAS.map(p=><button key={p} onClick={()=>setForm({...form,voicePersona:p})} style={{padding:"7px 16px",border:"2px solid",borderRadius:20,fontFamily:"var(--fd)",fontWeight:700,fontSize:11,cursor:"pointer",borderColor:form.voicePersona===p?"var(--black)":"var(--border)",background:form.voicePersona===p?"var(--black)":"#fff",color:form.voicePersona===p?"#fff":"var(--black)"}}>{p}</button>)}</div></div>
+            <div style={{display:"flex",justifyContent:"space-between"}}><button className="t-btn t-btn-outline" onClick={onBack}>Cancel</button><button className="t-btn t-btn-black" style={{borderRadius:20}} disabled={!form.displayName||!form.language||!form.voicePersona} onClick={()=>setStep(2)}>Proceed to Call Agent →</button></div>
+          </div>
+        )}
+        {step===2 && (
+          <div style={{display:"flex",flex:1}}>
+            <div style={{flex:1,padding:"28px 32px",overflowY:"auto"}}>
+              <h2 style={{fontFamily:"var(--fd)",fontWeight:900,fontSize:20,marginBottom:24}}>Set Up Call Agent</h2>
+              <div style={{marginBottom:14}}><label className="t-label" style={{marginBottom:5}}>Objective <span style={{color:"var(--red)"}}>*</span></label><input className="t-input" style={{fontSize:12}} maxLength={140} placeholder="e.g. Qualify candidates for field sales in Bangalore" value={form.objective} onChange={e=>setForm({...form,objective:e.target.value})}/><div style={{textAlign:"right",fontSize:9,color:"var(--muted)",marginTop:1}}>{form.objective.length}/140</div></div>
+              <div style={{marginBottom:14}}><label className="t-label" style={{marginBottom:5}}>Introductory Statement <span style={{color:"var(--red)"}}>*</span></label><input className="t-input" style={{fontSize:12,color:"#6739b7"}} value={form.introduction} onChange={e=>setForm({...form,introduction:e.target.value})}/></div>
+              <div style={{marginBottom:20}}>
+                <label className="t-label" style={{marginBottom:5}}>Call Prompt <span style={{color:"var(--red)"}}>*</span></label>
+                <div style={{background:"#fffbeb",border:"1px solid #fcd34d",padding:"7px 10px",fontSize:10,color:"#92400e",marginBottom:6}}>📌 Define the agent persona, context, and expected call flow.</div>
+                <textarea className="t-input" rows={14} style={{fontSize:11,fontFamily:"var(--fm)",resize:"vertical",lineHeight:1.6}} placeholder={"1. My Identity\n2. Context\n3. Conversation Flow"} value={form.agentPrompt} onChange={e=>setForm({...form,agentPrompt:e.target.value})}/>
+              </div>
+              <div style={{display:"flex",justifyContent:"space-between"}}><button className="t-btn t-btn-outline" onClick={()=>setStep(1)}>← Back</button><button className="t-btn t-btn-black" disabled={!form.objective||!form.agentPrompt} onClick={()=>setStep(3)}>Proceed to Result Agent →</button></div>
+            </div>
+            <Preview/>
+          </div>
+        )}
+        {step===3 && (
+          <div style={{display:"flex",flex:1}}>
+            <div style={{flex:1,padding:"28px 32px",overflowY:"auto"}}>
+              <h2 style={{fontFamily:"var(--fd)",fontWeight:900,fontSize:20,marginBottom:24}}>Result Agent Set Up</h2>
+              <div style={{marginBottom:20}}>
+                <label className="t-label" style={{marginBottom:8}}>Result Values <span style={{color:"var(--red)"}}>*</span></label>
+                <div style={{border:"1.5px solid var(--black)",overflow:"hidden",marginBottom:8}}>
+                  <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                    <thead><tr style={{background:"var(--black)"}}><th style={{padding:"7px 10px",color:"#fff",fontFamily:"var(--fd)",fontWeight:700,fontSize:9,letterSpacing:".12em",textAlign:"left",width:32}}>No</th><th style={{padding:"7px 10px",color:"#fff",fontFamily:"var(--fd)",fontWeight:700,fontSize:9,letterSpacing:".12em",textAlign:"left"}}>Column Name</th><th style={{padding:"7px 10px",color:"#fff",fontFamily:"var(--fd)",fontWeight:700,fontSize:9,letterSpacing:".12em",textAlign:"left"}}>Expected Values</th><th style={{width:30}}/></tr></thead>
+                    <tbody>
+                      {form.resultFields.map((rf,i)=>(
+                        <tr key={i} style={{borderBottom:"1px solid #eee"}}>
+                          <td style={{padding:"4px 10px",color:"var(--muted)",fontFamily:"var(--fm)"}}>{i+1}.</td>
+                          <td style={{padding:"3px 6px"}}><input className="t-input" style={{fontSize:11,padding:"5px 7px",border:"1px solid #eee"}} placeholder="e.g. interested" value={rf.name} onChange={e=>updateRF(i,"name",e.target.value)}/></td>
+                          <td style={{padding:"3px 6px"}}><input className="t-input" style={{fontSize:11,padding:"5px 7px",border:"1px solid #eee"}} placeholder="e.g. Yes / No" value={rf.expected} onChange={e=>updateRF(i,"expected",e.target.value)}/></td>
+                          <td style={{padding:"3px 6px",textAlign:"center"}}><button onClick={()=>removeRF(i)} style={{background:"none",border:"none",cursor:"pointer",color:"var(--muted)",fontSize:14}}>×</button></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <button className="t-btn t-btn-outline t-btn-sm" onClick={addRF}>+ Add More</button>
+              </div>
+              <div style={{marginBottom:20}}>
+                <label className="t-label" style={{marginBottom:5}}>Result Prompt <span style={{color:"var(--red)"}}>*</span></label>
+                <textarea className="t-input" rows={10} style={{fontSize:11,fontFamily:"var(--fm)",resize:"vertical",lineHeight:1.6}} placeholder={"Evaluate the call and extract key information."} value={form.resultPrompt} onChange={e=>setForm({...form,resultPrompt:e.target.value})}/>
+              </div>
+              <div style={{display:"flex",justifyContent:"space-between"}}><button className="t-btn t-btn-outline" onClick={()=>setStep(2)}>← Back</button><button className="t-btn t-btn-black" disabled={form.resultFields.filter(f=>f.name).length===0||!form.resultPrompt} onClick={()=>setStep(4)}>Proceed to Qualification →</button></div>
+            </div>
+            <Preview/>
+          </div>
+        )}
+        {step===4 && (
+          <div style={{display:"flex",flex:1}}>
+            <div style={{flex:1,padding:"28px 32px",overflowY:"auto"}}>
+              <h2 style={{fontFamily:"var(--fd)",fontWeight:900,fontSize:20,marginBottom:8}}>Qualification Rules</h2>
+              <p style={{fontSize:12,color:"var(--muted)",marginBottom:20,lineHeight:1.6}}>Choose which result fields determine a qualified lead.</p>
+              {definedFields.length===0
+                ? <Alert type="info">← Go back and define at least one result field first.</Alert>
+                : (
+                  <>
+                    <div style={{border:"1.5px solid var(--black)",marginBottom:14}}>
+                      <div style={{padding:"7px 12px",background:"#f5f5f5",borderBottom:"1px solid #eee",fontFamily:"var(--fd)",fontWeight:700,fontSize:9,letterSpacing:".15em",textTransform:"uppercase",color:"var(--muted)"}}>Select qualification fields</div>
+                      {definedFields.map(f=>{
+                        const isSel=qualRules[f]!==undefined;
+                        return (<label key={f} style={{display:"flex",alignItems:"center",gap:10,padding:"9px 12px",borderBottom:"1px solid #f5f5f5",cursor:"pointer",background:isSel?"#f0f5ff":"transparent"}}><input type="checkbox" checked={isSel} onChange={()=>toggleQF(f)} style={{width:13,height:13}}/><span style={{flex:1,fontFamily:"var(--fm)",fontSize:12}}>{f}</span>{isSel&&<span style={{fontSize:9,color:"var(--blue)",fontFamily:"var(--fd)",fontWeight:700,letterSpacing:".08em"}}>ACTIVE</span>}</label>);
+                      })}
+                    </div>
+                    {Object.keys(qualRules).map(field=>{
+                      const kws=qualRules[field]||[];
+                      return (
+                        <div key={field} style={{border:"1.5px solid #0066b3",padding:"11px 13px",marginBottom:10,background:"#f0f8ff"}}>
+                          <div style={{fontFamily:"var(--fm)",fontSize:12,fontWeight:700,color:"var(--blue)",marginBottom:6}}>{field}</div>
+                          <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:7}}>
+                            {kws.map(kw=><span key={kw} className="t-kwtag">~{kw}<button className="t-kwtag-rm" onClick={()=>rmKw(field,kw)}>×</button></span>)}
+                            {kws.length===0&&<span style={{fontSize:10,color:"var(--muted)",fontStyle:"italic"}}>Any non-empty value qualifies</span>}
+                          </div>
+                          <div style={{display:"flex",gap:6}}><input className="t-input" style={{flex:1,fontSize:11,padding:"5px 8px"}} value={kwInputs[field]||""} placeholder="Add keyword (e.g. yes, interested)…" onChange={e=>setKwInputs(p=>({...p,[field]:e.target.value}))} onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();addKw2(field);}}}/><button className="t-btn t-btn-black t-btn-sm" onClick={()=>addKw2(field)}>+ Add</button></div>
+                        </div>
+                      );
+                    })}
+                  </>
+                )
+              }
+              {msg.text && <div style={{marginBottom:12}}><Alert type={msg.type==="error"?"error":"success"}>{msg.text}</Alert></div>}
+              <div style={{display:"flex",justifyContent:"space-between",paddingTop:8}}><button className="t-btn t-btn-outline" onClick={()=>setStep(3)}>← Back</button><button className="t-btn t-btn-black" disabled={saving} onClick={()=>onSave(form,qualRules)}>{saving?<Spin/>:editAgent?"Update Agent":"Create Agent"}</button></div>
+            </div>
+            <Preview/>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -2269,7 +3044,11 @@ function App() {
 
   async function refreshMe(){ const r=await api("me",{}); if(r.ok){setUser(r.user);setToday(r.today);setAgents(r.agents||[]);} }
   async function refreshTeams(){ const r=await api("listTeams",{}); if(r.ok)setTeams(r.teams||[]); }
-  async function refreshUsers(){ if(user&&user.role!=="recruiter"){const r=await api("listUsers",{});if(r.ok)setUsers(r.users||[]);} }
+  async function refreshUsers(){
+    if(user && user.role!=="recruiter" && user.role!=="individual_contributor"){
+      const r=await api("listUsers",{}); if(r.ok)setUsers(r.users||[]);
+    }
+  }
 
   useEffect(()=>{
     const params=new URLSearchParams(window.location.search);
@@ -2284,7 +3063,7 @@ function App() {
     })();
   },[]);
 
-  useEffect(()=>{if(bootScreen==="app"){refreshTeams();refreshUsers();}},[bootScreen]);
+  useEffect(()=>{if(bootScreen==="app"){refreshTeams();refreshUsers();}},[bootScreen,user]);
 
   async function onLogout(){ await api("logout",{}); localStorage.removeItem("session"); window.location.search=""; }
   function onViewLeads(agentCode, requestId) { setLeadsFilter({agentCode, requestId}); setView("leads"); }
@@ -2293,16 +3072,16 @@ function App() {
   if(bootScreen==="login") return <LoginScreen onLoggedIn={u=>{setUser(u);setBootScreen("app");refreshMe();}} goForgot={()=>setBootScreen("forgot")}/>;
   if(bootScreen==="forgot") return <ForgotScreen goLogin={()=>setBootScreen("login")}/>;
   if(bootScreen==="setup") return <SetupScreen token={setupToken} goLogin={()=>{setBootScreen("login");window.history.replaceState({},"",window.location.pathname);}} onCompleted={u=>{setUser(u);setBootScreen("app");window.history.replaceState({},"",window.location.pathname);refreshMe();}}/>;
+  if(!user) return <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center"}}><Spin/></div>;
 
   let content=null;
   if(view==="dashboard") content=<DashboardView user={user} agents={agents} selectedAgent={selAgent} setSelectedAgent={setSelAgent}/>;
   else if(view==="leads") content=<LeadsView user={user} users={users} agents={agents} teams={teams} initialFilter={leadsFilter} onClearFilter={()=>setLeadsFilter(null)}/>;
   else if(view==="trigger") content=<UploadView user={user} agents={agents} refreshMe={refreshMe}/>;
   else if(view==="campaigns") content=<CampaignsView agents={agents} user={user} teams={teams} onViewLeads={onViewLeads}/>;
-  else if(view==="agents") content=<AgentsView onChange={setAgents}/>;
+  else if(view==="myagents") content=<TLAgentsView user={user} agents={agents} refreshAgents={newAgents=>{setAgents(newAgents);}}/>;
   else if(view==="users") content=<UsersView user={user} teams={teams}/>;
   else if(view==="teams") content=<TeamsView user={user} agents={agents}/>;
-  else if(view==="usage") content=<UsageView/>;
 
   return (
     <>
@@ -2311,6 +3090,118 @@ function App() {
       </Shell>
       {showChangePw && <ChangePasswordModal onClose={()=>setShowChangePw(false)}/>}
     </>
+  );
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// SETUP / DATABASE MIGRATION VIEW (super admin only)
+// ─────────────────────────────────────────────────────────────
+function SetupView() {
+  const [statuses, setStatuses] = useState({});
+  const [busy, setBusy] = useState({});
+
+  async function run(key, action, payload={}) {
+    setBusy(p=>({...p,[key]:true}));
+    setStatuses(p=>({...p,[key]:{type:"info",text:"Running…"}}));
+    try {
+      const r = await api(action, payload);
+      if(r.ok) setStatuses(p=>({...p,[key]:{type:"ok",text:r.message||JSON.stringify(r).slice(0,200)}}));
+      else setStatuses(p=>({...p,[key]:{type:"err",text:r.message||r.error||"Failed"}}));
+    } catch(e) {
+      setStatuses(p=>({...p,[key]:{type:"err",text:String(e.message||e)}}));
+    }
+    setBusy(p=>({...p,[key]:false}));
+  }
+
+  const sections = [
+    {
+      title:"Sheet Infrastructure",
+      desc:"Ensures all required tabs (Users, Teams, Agents, Sessions, Audit, Trigger Log) exist and have correct headers. Additive only — never deletes data.",
+      actions:[
+        {key:"setupPortalSheets",label:"Setup Portal Sheets",action:"setupsheets",danger:false},
+      ]
+    },
+    {
+      title:"Triggers",
+      desc:"Installs background triggers: pollActiveBatches (1 min), backfillMissingOutputs (5 min), cleanupExpiredSessions (1 hr), repairUnassignedLeads (10 min). Safe to re-run.",
+      actions:[
+        {key:"installTriggers",label:"Install All Triggers",action:"installtriggers",danger:false},
+      ]
+    },
+    {
+      title:"Agent Sheet Repair",
+      desc:"Re-fetches result schemas from Hunar and ensures every active agent has the correct output columns in their Master Tracker, Qualified Leads, and other sheets. Additive only.",
+      actions:[
+        {key:"repairAgentSheets",label:"Repair Agent Sheets",action:"repairagentsheets",danger:false},
+      ]
+    },
+    {
+      title:"Data Deduplication",
+      desc:"Removes duplicate Call ID rows from Master Tracker, Not Connected, and Qualified Leads sheets. Safe — only removes exact duplicates based on Call ID.",
+      actions:[
+        {key:"dedupeAll",label:"Dedupe All Sheets",action:"dedupeallsheets",danger:false},
+        {key:"dedupeLeads",label:"Dedupe Qualified Leads Only",action:"dedupeleadsnow",danger:false},
+      ]
+    },
+    {
+      title:"Data Backfill",
+      desc:"Fetches missing result data for COMPLETED calls that have empty output fields. Fills in call duration, results, and moves qualified leads. Non-destructive.",
+      actions:[
+        {key:"backfill",label:"Backfill Missing Outputs",action:"backfillnow",danger:false},
+      ]
+    },
+    {
+      title:"Queue Processing",
+      desc:"Manually trigger the callback and retry queues. Processes any pending callback or not-connected retry campaigns that are due today.",
+      actions:[
+        {key:"runCallback",label:"Process Callback Queue",action:"runcallbacknow",danger:false},
+        {key:"runRetry",label:"Process Retry Queue",action:"runretrynow",danger:false},
+      ]
+    },
+  ];
+
+  return (
+    <div className="t-fade">
+      <div className="t-mast">
+        <div><div className="t-mast-title">Database Setup</div><div className="t-mast-sub">Additive migrations · safe to run on new deployments</div></div>
+      </div>
+      <div style={{padding:"16px 20px",background:"#fffbe6",borderBottom:"2px solid var(--yellow)",display:"flex",gap:10,alignItems:"flex-start"}}>
+        <span style={{fontSize:16}}>⚠️</span>
+        <div style={{fontSize:12,lineHeight:1.6}}>
+          <b>These operations are additive and non-destructive.</b> They add missing sheets and columns, repair broken references, and fill in missing data — but never delete existing rows or sheets. Safe to run after any new deployment.
+        </div>
+      </div>
+      <div style={{padding:20,display:"flex",flexDirection:"column",gap:20,maxWidth:720}}>
+        {sections.map(sec=>(
+          <div key={sec.title} style={{border:"1.5px solid var(--border)",borderRadius:4,overflow:"hidden"}}>
+            <div style={{background:"#f5f5f5",padding:"12px 16px",borderBottom:"1px solid var(--border)"}}>
+              <div style={{fontFamily:"var(--fd)",fontWeight:900,fontSize:13,letterSpacing:"-.01em"}}>{sec.title}</div>
+              <div style={{fontSize:11,color:"var(--muted)",marginTop:3,lineHeight:1.5}}>{sec.desc}</div>
+            </div>
+            <div style={{padding:"14px 16px",display:"flex",flexDirection:"column",gap:10}}>
+              {sec.actions.map(act=>(
+                <div key={act.key} style={{display:"flex",alignItems:"flex-start",gap:12}}>
+                  <button
+                    className={"t-btn " + (act.danger?"t-btn-red":"t-btn-black")}
+                    disabled={!!busy[act.key]}
+                    onClick={()=>run(act.key,act.action)}
+                    style={{minWidth:220,flexShrink:0}}
+                  >
+                    {busy[act.key] ? <Spin/> : act.label}
+                  </button>
+                  {statuses[act.key] && (
+                    <div className={"t-alert t-alert-"+statuses[act.key].type} style={{flex:1,fontSize:11,fontFamily:"var(--fm)",wordBreak:"break-word"}}>
+                      {statuses[act.key].text}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
