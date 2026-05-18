@@ -1,3 +1,4 @@
+
 <!doctype html>
 <html lang="en">
 <head>
@@ -348,7 +349,6 @@ input[type=checkbox]{accent-color:var(--black);cursor:pointer}
 <div id="root"></div>
 <script type="text/babel" data-presets="react">
 const API_URL = "https://voxa-hunar-volume.onrender.com/api";
-
 
 const { useState, useEffect, useMemo, useRef, useCallback } = React;
 const R = (typeof Recharts !== "undefined") ? Recharts : {};
@@ -1839,7 +1839,19 @@ function CampaignsView({ agents, user, teams, onViewLeads }) {
   const [campaignTab,setCampaignTab]=useState("qualified");
 
   useEffect(()=>{
-    (async()=>{ setLoading(true); const r=await api("getCampaigns",{agentCode:selAgent}); setLoading(false); if(r.ok)setRows(r.campaigns||[]); })();
+    (async()=>{ setLoading(true); const r=await api("getCampaigns",{agentCode:selAgent}); setLoading(false);if(r.ok) {
+  const seen = new Set();
+  const unique = (r.campaigns||[]).filter(c => {
+    // Deduplicate by both requestId AND campaignName+triggeredAt to catch backend duplicates
+    const byId = c.requestId;
+    const byName = (c.campaignName||"") + "|" + (c.triggeredAt||"");
+    if (seen.has(byId) || seen.has(byName)) return false;
+    seen.add(byId);
+    if (byName !== "|") seen.add(byName);
+    return true;
+  });
+  setRows(unique);
+} })();
   },[selAgent]);
 
   if(openCampaign) {
@@ -4869,4 +4881,3 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
 </script>
 </body>
 </html>
-
