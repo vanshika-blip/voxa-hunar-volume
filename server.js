@@ -1181,15 +1181,22 @@ async function _addToLineupFromAI(actor, agent, row, headers, callId) {
     const users  = await getAllUsers();
     const actorF = users.find(u => u.email === actor.email);
     if (!actorF?.team) return;
-    const team = await findTeam(actorF.team);
-    if (!team?.spreadsheetId) return;
-    await _addToLineup(team.spreadsheetId, 'AI', { agent, row, headers, callId });
+    // Use central SS (LINEUP_SS_ID) if configured, else per-team SS
+    if (LINEUP_SS_ID) {
+      await _addToLineup(LINEUP_SS_ID, 'AI', { agent, row, headers, callId, lineupSheet: actorF.team });
+    } else {
+      const team = await findTeam(actorF.team);
+      if (!team?.spreadsheetId) return;
+      await _addToLineup(team.spreadsheetId, 'AI', { agent, row, headers, callId, lineupSheet: TEAM_SH.LINEUP });
+    }
   } catch (_) {}
 }
 
-async function _addToLineup(teamSsId, source, payload) {
-  await ensureSheet(teamSsId, TEAM_SH.LINEUP, LINEUP_H, '#5b21b6');
-  const { headers: h } = await readSheet(teamSsId, TEAM_SH.LINEUP);
+async function _addToLineup(ssId, source, payload) {
+  // lineupSheet = tab name (team name for central SS, 'Interview_Lineup' for per-team SS)
+  const sheetName = payload.lineupSheet || TEAM_SH.LINEUP;
+  await ensureSheet(ssId, sheetName, LINEUP_H, '#5b21b6');
+  const { headers: h } = await readSheet(ssId, sheetName);
   const out  = {};
   LINEUP_H.forEach(hh => { out[hh] = ''; });
   let lookupId = '';
@@ -1237,11 +1244,11 @@ async function _addToLineup(teamSsId, source, payload) {
   }
 
   // Idempotency check
-  const { rows: existRows } = await readSheet(teamSsId, TEAM_SH.LINEUP);
+  const { rows: existRows } = await readSheet(ssId, sheetName);
   const cc = h.indexOf('Call ID');
   if (cc >= 0 && existRows.some(r => String(r[cc] || '').trim() === lookupId)) return { ok: true, action: 'exists' };
   const rowVals = h.map(hh => out[hh] !== undefined ? out[hh] : '');
-  await appendRows(teamSsId, TEAM_SH.LINEUP, [rowVals]);
+  await appendRows(ssId, sheetName, [rowVals]);
   return { ok: true, action: 'appended' };
 }
 
@@ -1585,8 +1592,35 @@ async function handleGetUsage(actor) {
 async function handleGetManualTracker(actor, body) {
   const teamName = actor.role === 'super_admin' ? String(body.team || '') : actor.team;
   if (!teamName && actor.role !== 'super_admin') return { ok: true, rows: [] };
+
+  // ── Central SS path (MANUAL_TRACKER_SS_ID env var set) ───────────────────
+  // Data lives in Voxa Central Manual Tracker, one tab per team name.
+  // This matches how handleGetDashboard already reads manual stats.
+  if (MANUAL_TRACKER_SS_ID) {
+    const visTeams = teamName
+      ? [teamName]
+      : (await getAllTeams()).map(t => t.name);
+    const all = [];
+    for (const tn of visTeams) {
+      try {
+        const { headers, rows } = await readSheet(MANUAL_TRACKER_SS_ID, tn);
+        if (!headers.length) continue;
+        rows.forEach(r => {
+          const o = { _team: tn };
+          headers.forEach((h, i) => { o[h] = r[i]; });
+          if (o['Unique ID']) all.push(o);
+        });
+      } catch (_) {}
+    }
+    let data = all;
+    if (actor.role === 'recruiter' || actor.role === 'individual_contributor') {
+      data = data.filter(r => String(r['Added By Email'] || '').toLowerCase() === actor.email);
+    }
+    return { ok: true, rows: data };
+  }
+
+  // ── Per-team SS fallback (no central SS configured) ──────────────────────
   if (!teamName) {
-    // Super admin: all teams
     const teams = await getAllTeams(); const all = [];
     for (const t of teams) {
       if (!t.spreadsheetId) continue;
@@ -1598,7 +1632,7 @@ async function handleGetManualTracker(actor, body) {
     return { ok: true, rows: all };
   }
   const team = await findTeam(teamName);
-  if (!team?.spreadsheetId) return { ok: true, rows: [] };
+  if (!team?.spreadsheetId) return { ok: true, rows: [], _warn: 'team has no spreadsheetId' };
   const { headers, rows } = await readSheet(team.spreadsheetId, TEAM_SH.MANUAL);
   let data = rows.map(r => { const o = {}; headers.forEach((h, i) => { o[h] = r[i]; }); return o; }).filter(r => r['Unique ID']);
   if (actor.role === 'recruiter') data = data.filter(r => String(r['Added By Email'] || '').toLowerCase() === actor.email);
@@ -1609,19 +1643,30 @@ async function handleAddManualEntry(actor, body) {
   const entry = body.entry || {};
   const name  = String(entry.candidateName || '').trim();
   const phone = String(entry.contactNumber || '').replace(/\D/g, '');
-  if (!name)         return { ok: false, error: 'CANDIDATE_NAME_REQUIRED' };
+  if (!name)             return { ok: false, error: 'CANDIDATE_NAME_REQUIRED' };
   if (phone.length < 10) return { ok: false, error: 'INVALID_PHONE' };
   const teamName = actor.role === 'super_admin' ? String(body.team || entry.team || '') : actor.team;
   if (!teamName) return { ok: false, error: 'NO_TEAM' };
-  const team = await findTeam(teamName);
-  if (!team?.spreadsheetId) return { ok: false, error: 'TEAM_NO_SPREADSHEET' };
-  await ensureSheet(team.spreadsheetId, TEAM_SH.MANUAL, MANUAL_H, '#0369a1');
+
+  // Resolve write target: central SS (one tab per team) or per-team SS
+  let writeSSId, writeSheet;
+  if (MANUAL_TRACKER_SS_ID) {
+    writeSSId  = MANUAL_TRACKER_SS_ID;
+    writeSheet = teamName; // tab named after team in the central SS
+  } else {
+    const team = await findTeam(teamName);
+    if (!team?.spreadsheetId) return { ok: false, error: 'TEAM_NO_SPREADSHEET' };
+    writeSSId  = team.spreadsheetId;
+    writeSheet = TEAM_SH.MANUAL;
+  }
+
+  await ensureSheet(writeSSId, writeSheet, MANUAL_H, '#0369a1');
   const now = new Date();
   const uid = `MT_${now.toISOString().slice(0,19).replace(/[-:T]/g,'')}_ ${actor.email.split('@')[0].slice(0,6).toUpperCase()}`.replace(/\s/g,'');
   let dv = now;
   try { if (entry.date) dv = new Date(entry.date); } catch (_) {}
   const row = [uid, dv.toISOString(), name, phone, entry.location || '', entry.client || '', entry.role || '', entry.source || '', '', '', '', actor.email, actor.name || actor.email, teamName, false, now.toISOString()];
-  await appendRows(team.spreadsheetId, TEAM_SH.MANUAL, [row]);
+  await appendRows(writeSSId, writeSheet, [row]);
   audit(actor.email, 'add_manual_entry', uid, name).catch(() => {});
   return { ok: true, uniqueId: uid };
 }
@@ -1631,9 +1676,18 @@ async function handleUpdateManualEntry(actor, body) {
   if (!uid) return { ok: false, error: 'UNIQUE_ID_REQUIRED' };
   const teamName = actor.role === 'super_admin' ? String(body.team || '') : actor.team;
   if (!teamName) return { ok: false, error: 'NO_TEAM' };
-  const team = await findTeam(teamName);
-  if (!team?.spreadsheetId) return { ok: false, error: 'TEAM_NOT_FOUND' };
-  const { headers, rows } = await readSheet(team.spreadsheetId, TEAM_SH.MANUAL);
+
+  // Resolve SS + sheet (central or per-team)
+  let ssId, sheetName;
+  if (MANUAL_TRACKER_SS_ID) {
+    ssId = MANUAL_TRACKER_SS_ID; sheetName = teamName;
+  } else {
+    const team = await findTeam(teamName);
+    if (!team?.spreadsheetId) return { ok: false, error: 'TEAM_NOT_FOUND' };
+    ssId = team.spreadsheetId; sheetName = TEAM_SH.MANUAL;
+  }
+
+  const { headers, rows } = await readSheet(ssId, sheetName);
   const idCol = headers.indexOf('Unique ID');
   if (idCol < 0) return { ok: false, error: 'MISSING_ID_COL' };
   const ALLOWED = ['Call Status','Lined-up','Remarks','Candidate Name','Contact Number','Client','Role','Source','Location','Date'];
@@ -1649,14 +1703,16 @@ async function handleUpdateManualEntry(actor, body) {
       if (k === 'Date' && v) { try { v = new Date(v).toISOString(); } catch (_) {} }
       newRow[col] = v;
     });
-    await writeRow(team.spreadsheetId, TEAM_SH.MANUAL, i + 2, newRow);
+    await writeRow(ssId, sheetName, i + 2, newRow);
     // Lineup hook
     if (String(fields['Lined-up'] || '').toLowerCase().trim() === 'yes') {
       const entry = {};
       headers.forEach((h, j) => { entry[h] = newRow[j]; });
-      _addToLineup(team.spreadsheetId, 'Manual', { entry, uniqueId: uid }).catch(() => {});
+      const lineupSsId = LINEUP_SS_ID || ssId;
+      const lineupSheet = LINEUP_SS_ID ? teamName : TEAM_SH.LINEUP;
+      _addToLineup(lineupSsId, 'Manual', { entry, uniqueId: uid, lineupSheet }).catch(() => {});
       const ilCol = headers.indexOf('In Lineup');
-      if (ilCol >= 0) { newRow[ilCol] = true; await writeRow(team.spreadsheetId, TEAM_SH.MANUAL, i + 2, newRow); }
+      if (ilCol >= 0) { newRow[ilCol] = true; await writeRow(ssId, sheetName, i + 2, newRow); }
     }
     return { ok: true, rejected };
   }
@@ -1667,6 +1723,33 @@ async function handleUpdateManualEntry(actor, body) {
 async function handleGetInterviewLineup(actor, body) {
   const teamName = actor.role === 'super_admin' ? String(body.team || '') : actor.team;
   if (!teamName && actor.role !== 'super_admin') return { ok: true, rows: [], headers: [] };
+
+  // ── Central SS path (LINEUP_SS_ID env var set) ───────────────────────────
+  if (LINEUP_SS_ID) {
+    const visTeams = teamName
+      ? [teamName]
+      : (await getAllTeams()).map(t => t.name);
+    const all = []; let firstHeaders = [];
+    for (const tn of visTeams) {
+      try {
+        const { headers: h, rows } = await readSheet(LINEUP_SS_ID, tn);
+        if (!h.length) continue;
+        if (!firstHeaders.length) firstHeaders = h;
+        rows.forEach(r => {
+          const o = { _team: tn };
+          h.forEach((hh, i) => { o[hh] = r[i]; });
+          if (o['Call ID']) all.push(o);
+        });
+      } catch (_) {}
+    }
+    let data = all;
+    if (actor.role === 'recruiter' || actor.role === 'individual_contributor') {
+      data = data.filter(r => String(r['Assigned Recruiter Email'] || '').toLowerCase() === actor.email);
+    }
+    return { ok: true, rows: data, headers: firstHeaders };
+  }
+
+  // ── Per-team SS fallback ─────────────────────────────────────────────────
   if (!teamName) {
     const teams = await getAllTeams(); const all = []; let headers = [];
     for (const t of teams) {
@@ -1680,7 +1763,7 @@ async function handleGetInterviewLineup(actor, body) {
     return { ok: true, rows: all, headers };
   }
   const team = await findTeam(teamName);
-  if (!team?.spreadsheetId) return { ok: true, rows: [], headers: [] };
+  if (!team?.spreadsheetId) return { ok: true, rows: [], headers: [], _warn: 'team has no spreadsheetId' };
   const { headers, rows } = await readSheet(team.spreadsheetId, TEAM_SH.LINEUP);
   let data = rows.map(r => { const o = {}; headers.forEach((h, i) => { o[h] = r[i]; }); return o; }).filter(r => r['Call ID']);
   if (actor.role === 'recruiter') data = data.filter(r => String(r['Assigned Recruiter Email'] || '').toLowerCase() === actor.email);
@@ -1692,9 +1775,18 @@ async function handleUpdateInterviewLead(actor, body) {
   if (!callId) return { ok: false, error: 'CALL_ID_REQUIRED' };
   const teamName = actor.role === 'super_admin' ? String(body.team || '') : actor.team;
   if (!teamName) return { ok: false, error: 'NO_TEAM' };
-  const team = await findTeam(teamName);
-  if (!team?.spreadsheetId) return { ok: false, error: 'NO_TEAM_SS' };
-  const { headers, rows } = await readSheet(team.spreadsheetId, TEAM_SH.LINEUP);
+
+  // Resolve SS + sheet
+  let ssId, sheetName;
+  if (LINEUP_SS_ID) {
+    ssId = LINEUP_SS_ID; sheetName = teamName;
+  } else {
+    const team = await findTeam(teamName);
+    if (!team?.spreadsheetId) return { ok: false, error: 'NO_TEAM_SS' };
+    ssId = team.spreadsheetId; sheetName = TEAM_SH.LINEUP;
+  }
+
+  const { headers, rows } = await readSheet(ssId, sheetName);
   const cc = headers.indexOf('Call ID');
   if (cc < 0) return { ok: false, error: 'NO_CALL_ID_COL' };
   const ALLOWED = ['Selection Process','Turnup Status','Email','DOB','Qualification','Work Experience','Current CTC','Expected CTC','Notice Period','Role','Location','CIBIL Score','SPOC Name','Current Employer','CV Link'];
@@ -1706,7 +1798,7 @@ async function handleUpdateInterviewLead(actor, body) {
       if (!ALLOWED.includes(k)) { rejected.push(k); return; }
       const col = headers.indexOf(k); if (col >= 0) newRow[col] = body.fields[k];
     });
-    await writeRow(team.spreadsheetId, TEAM_SH.LINEUP, i + 2, newRow);
+    await writeRow(ssId, sheetName, i + 2, newRow);
     return { ok: true, rejected };
   }
   return { ok: false, error: 'NOT_FOUND' };
