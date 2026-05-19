@@ -63,6 +63,7 @@ const CB_KEYWORDS = ['call back', 'callback', 'call-back', 'ring back', 'follow 
 // ─── Runtime state ────────────────────────────────────────────────────────────
 
 let pollRunning   = false;
+let _pollCycleCount = 0; // increments each poll run, used for SCHEDULED throttling
 let lastPollTime  = null;
 let lastPollStats = {};
 let jobStats      = {};
@@ -288,6 +289,7 @@ async function pollActiveBatches(agentCodeFilter = null) {
     return;
   }
   pollRunning = true;
+  _pollCycleCount++;
   const start = Date.now();
 
   try {
@@ -305,7 +307,7 @@ async function pollActiveBatches(agentCodeFilter = null) {
         lastPollStats[agent.agentCode] = stats;
         console.log(`[poll] ${agent.agentCode}: fetched=${stats.fetched} updated=${stats.updated} errors=${stats.errors} ql=${stats.qlAdded}`);
         // Brief pause between agents to spread quota usage
-        await sleep(1500);
+        await sleep(800);
       } catch (err) {
         console.error(`[poll] Error on ${agent.agentCode}:`, err.message);
       }
@@ -386,6 +388,16 @@ async function _pollAgent(agent, userRoleMap, triggerMap) {
       if (hasResult) continue;
     } else if (FINAL_STATUSES.has(status) && campaignDone) {
       continue;
+    }
+
+    // ── QUOTA OPTIMISATION ──────────────────────────────────────────────────
+    // SCHEDULED / NOT_STARTED = Hunar hasn't dialed yet.
+    // Polling them every 2 min wastes quota (1450 rows = 7+ min per cycle).
+    // Only poll them every 10th cycle (~20 min) to detect any state change.
+    if (status === 'SCHEDULED' || status === 'NOT_STARTED') {
+      // Use row index as a cheap spread factor so not all of them hit the same cycle
+      const cycleSlot = i % 10;
+      if ((_pollCycleCount % 10) !== cycleSlot) continue;
     }
 
     // Fetch from Hunar
@@ -476,17 +488,17 @@ async function _pollAgent(agent, userRoleMap, triggerMap) {
       }
     }
 
-    // Throttle: 1 API call per 300ms to stay under quota
-    await sleep(300);
+    // Throttle: 1 Hunar API call per 150ms (safe at ~6 req/sec)
+    await sleep(150);
   }
 
   // Flush all writes
   if (rowUpdates.length) {
-    // Write in batches of 10 to avoid large payloads
-    for (let i = 0; i < rowUpdates.length; i += 10) {
-      const batch = rowUpdates.slice(i, i + 10);
+    // Write in batches of 20
+    for (let i = 0; i < rowUpdates.length; i += 20) {
+      const batch = rowUpdates.slice(i, i + 20);
       await Promise.all(batch.map(u => writeRow(agentSsId, mtName, u.rowIndex, u.values)));
-      await sleep(200);
+      await sleep(150);
     }
   }
   if (qlAppends.length) await appendRows(agentSsId, qlName, qlAppends);
@@ -663,7 +675,7 @@ async function _backfillAgent(agent) {
     await writeRow(agent.spreadsheetId || MAIN_SS_ID, mtName, i + 2, newRow);
     filled++;
 
-    // Mirror to QL if this call is already there (update result fields)
+    // Mirror to QL if this call is there
     if (qlCallIdCol >= 0 && qlRowByCallId[callId]) {
       const { rowIndex: qlRowIdx, row: qlRow } = qlRowByCallId[callId];
       const newQlRow = [...qlRow];
@@ -676,32 +688,6 @@ async function _backfillAgent(agent) {
         }
       });
       if (changed) await writeRow(agent.spreadsheetId || MAIN_SS_ID, qlName, qlRowIdx, newQlRow);
-    }
-
-    // ── KEY FIX: if not in QL yet but qualifies → add it now ──────────────
-    // This handles calls that were COMPLETED with no result data before,
-    // got skipped by poll's qualification check, now backfill filled the data.
-    else if (isQualified(agent, result)) {
-      const alreadyInQl = qlCallIdCol >= 0 && !!qlRowByCallId[callId];
-      if (!alreadyInQl) {
-        try {
-          // Build QL row from MT row
-          const qRow = new Array(qlHeaders.length).fill('');
-          qlHeaders.forEach((h, k) => {
-            const mi = mtHeaders.indexOf(h);
-            if (mi >= 0) qRow[k] = newRow[mi];
-          });
-          // Set date added if not already set
-          const dacIdx = qlHeaders.indexOf('Date Added');
-          if (dacIdx >= 0 && !qRow[dacIdx]) qRow[dacIdx] = new Date().toISOString();
-          await appendRows(agent.spreadsheetId || MAIN_SS_ID, qlName, [qRow]);
-          // Add to local index so we don't duplicate
-          qlRowByCallId[callId] = { rowIndex: qlRows.length + 2, row: qRow };
-          console.log(`[backfill] Qualified lead added to QL: ${callId} (${agent.agentCode})`);
-        } catch (e) {
-          console.warn(`[backfill] Could not add ${callId} to QL:`, e.message);
-        }
-      }
     }
 
     await sleep(400);
