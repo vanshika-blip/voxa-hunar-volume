@@ -18,7 +18,7 @@ const cron = require('node-cron');
 const axios = require('axios');
 const {
   readSheet, readSheetAsObjects, writeRow, writeRows, appendRows,
-  deleteRows, ensureSheet, testConnection, sleep, withRetry,
+  deleteRows, ensureSheet, testConnection, batchWriteRows, sleep, withRetry,
 } = require('./sheets');
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -492,13 +492,14 @@ async function _pollAgent(agent, userRoleMap, triggerMap) {
     await sleep(150);
   }
 
-  // Flush all writes
+  // Flush all writes — ONE batchUpdate call instead of N individual writes
+  // This is the key quota fix: N rows = 1 API call, not N API calls
   if (rowUpdates.length) {
-    // Write in batches of 20
-    for (let i = 0; i < rowUpdates.length; i += 20) {
-      const batch = rowUpdates.slice(i, i + 20);
-      await Promise.all(batch.map(u => writeRow(agentSsId, mtName, u.rowIndex, u.values)));
-      await sleep(150);
+    const BATCH = 100; // Google Sheets batchUpdate supports up to 100 ranges per call
+    for (let i = 0; i < rowUpdates.length; i += BATCH) {
+      const chunk = rowUpdates.slice(i, i + BATCH);
+      await batchWriteRows(agentSsId, mtName, chunk);
+      if (i + BATCH < rowUpdates.length) await sleep(500);
     }
   }
   if (qlAppends.length) await appendRows(agentSsId, qlName, qlAppends);
