@@ -64,8 +64,7 @@ const CB_KEYWORDS = ['call back', 'callback', 'call-back', 'ring back', 'follow 
 
 let pollRunning   = false;
 let _pollCycleCount = 0; // increments each poll run, used for SCHEDULED throttling
-const _agentCursors = {}; // { agentCode: lastRowIndex } — tracks where each agent left off
-const MAX_UPDATES_PER_AGENT = 50; // max rows to update per agent per poll cycle
+const MAX_UPDATES_PER_AGENT = 100; // max rows to fetch per agent per poll cycle
 let lastPollTime  = null;
 let lastPollStats = {};
 let jobStats      = {};
@@ -371,47 +370,73 @@ async function _pollAgent(agent, userRoleMap, triggerMap) {
   const ncAppends  = []; // arrays to append
   const ncDeletes  = []; // row indices to delete from NC
 
-  // Resume from where we left off last cycle (cursor-based processing)
-  const agentKey = agent.agentCode;
-  const startIdx = _agentCursors[agentKey] || 0;
-  let updateCount = 0;
-  let reachedEnd  = true;
+  // ── Priority-sorted processing ───────────────────────────────────────────
+  // 1. COMPLETED (missing result data) — highest priority, need results NOW
+  // 2. IN_PROGRESS — actively being processed
+  // 3. INITIATED   — queued, will start soon
+  // 4. SCHEDULED / NOT_STARTED — haven't started, lowest urgency
+  //
+  // Within each priority group: NEWEST rows first (bottom of sheet = most recent campaign)
+  // Cap at MAX_UPDATES_PER_AGENT so quota is never exceeded
 
-  for (let i = startIdx; i < mtRows.length; i++) {
-    // Cap: stop after MAX_UPDATES_PER_AGENT actual updates this cycle
-    if (updateCount >= MAX_UPDATES_PER_AGENT) {
-      // Save cursor so next cycle continues from here
-      _agentCursors[agentKey] = i;
-      reachedEnd = false;
-      console.log(`[poll] ${agent.agentCode}: cap reached at row ${i}/${mtRows.length}, resuming next cycle`);
-      break;
-    }
+  const rowPriority = (status, hasResult) => {
+    if (status === 'COMPLETED' && !hasResult) return 0; // most urgent
+    if (status === 'IN_PROGRESS')             return 1;
+    if (status === 'INITIATED')               return 2;
+    if (status === 'SCHEDULED')               return 3;
+    if (status === 'NOT_STARTED')             return 4;
+    return 5;
+  };
 
+  // Build candidate list
+  const candidates = [];
+  for (let i = 0; i < mtRows.length; i++) {
     const row    = mtRows[i];
     const callId = String(row[callIdCol] || '').trim();
-    const status = String(row[statusCol] || '').toUpperCase();
-    const reqId  = reqIdCol >= 0 ? String(row[reqIdCol] || '') : '';
-
     if (!callId) continue;
 
+    const status = String(row[statusCol] || '').toUpperCase();
+    const reqId  = reqIdCol >= 0 ? String(row[reqIdCol] || '') : '';
     const campaignDone = reqId && campaignStatus.get(reqId) === 'COMPLETED';
 
-    // Skip if already in a final state with data
-    if (status === 'COMPLETED') {
-      const hasResult = resultFields.some(f => {
-        const col = mtHeaders.indexOf('out.' + f);
-        return col >= 0 && String(row[col] || '').trim() !== '';
-      });
-      if (hasResult) continue;
-    } else if (FINAL_STATUSES.has(status) && campaignDone) {
-      continue;
+    // Skip truly done rows
+    if (FINAL_STATUSES.has(status) && status !== 'COMPLETED') {
+      if (campaignDone) continue;
     }
 
-    // SCHEDULED / NOT_STARTED: only check every 10th cycle
-    if (status === 'SCHEDULED' || status === 'NOT_STARTED') {
-      const cycleSlot = i % 10;
-      if ((_pollCycleCount % 10) !== cycleSlot) continue;
+    const hasResult = status === 'COMPLETED' && resultFields.some(f => {
+      const col = mtHeaders.indexOf('out.' + f);
+      return col >= 0 && String(row[col] || '').trim() !== '';
+    });
+
+    // Skip COMPLETED rows that already have full result data
+    if (status === 'COMPLETED' && hasResult) continue;
+
+    const priority = rowPriority(status, hasResult);
+
+    // SCHEDULED/NOT_STARTED: only include every 10th cycle (sparse polling)
+    if (priority >= 3) {
+      if ((_pollCycleCount % 10) !== (i % 10)) continue;
     }
+
+    candidates.push({ i, row, callId, status, reqId, priority });
+  }
+
+  // Sort: priority ASC, then row index DESC (newest first within same priority)
+  candidates.sort((a, b) => {
+    if (a.priority !== b.priority) return a.priority - b.priority;
+    return b.i - a.i; // newest row (highest index) first
+  });
+
+  // Take top N
+  const toProcess = candidates.slice(0, MAX_UPDATES_PER_AGENT);
+  if (candidates.length > MAX_UPDATES_PER_AGENT) {
+    console.log(`[poll] ${agent.agentCode}: ${candidates.length} pending, processing top ${MAX_UPDATES_PER_AGENT} (COMPLETED first, newest first)`);
+  }
+
+  let updateCount = 0;
+
+  for (const { i, row, callId, status, reqId } of toProcess) {
 
     // Fetch from Hunar
     stats.fetched++;
@@ -505,9 +530,6 @@ async function _pollAgent(agent, userRoleMap, triggerMap) {
     // Throttle: 1 Hunar API call per 150ms (safe at ~6 req/sec)
     await sleep(150);
   }
-
-  // Reset cursor if we processed all rows
-  if (reachedEnd) _agentCursors[agentKey] = 0;
 
   // Flush all writes — ONE batchUpdate call instead of N individual writes
   // This is the key quota fix: N rows = 1 API call, not N API calls

@@ -1007,7 +1007,7 @@ async function handleUploadContacts(actor, body) {
   if (!agent.active)        return { ok: false, error: 'AGENT_INACTIVE' };
   if (!agent.spreadsheetId) return { ok: false, error: 'AGENT_NO_SPREADSHEET' };
   const agents = await getAllAgents();
-  if (!agentsVisibleTo(actor, agents).find(a => a.agentCode === agentCode)) return { ok: false, error: 'AGENT_NOT_VISIBLE' };
+  if (!agentsVisibleTo(actor, agents, usersVis).find(a => a.agentCode === agentCode)) return { ok: false, error: 'AGENT_NOT_VISIBLE' };
 
   const estMin = rows.length * agent.estSecondsPerCall / 60;
   if (actor.role !== 'super_admin') {
@@ -1299,6 +1299,7 @@ async function handleGetMasterTracker(actor, body) {
   if (!agentCode) return { ok: false, error: 'AGENT_CODE_REQUIRED' };
   const agent = await findAgent(agentCode);
   if (!agent || !agent.spreadsheetId) return { ok: false, error: 'AGENT_NOT_FOUND' };
+  const usersVis = await getAllUsers();
   const { headers, rows } = await readSheet(agent.spreadsheetId, AGT.MT);
   const reqId = String(body.requestId || '');
   let result  = rows.map(r => { const o = {}; headers.forEach((h, i) => { o[h] = r[i]; }); return o; });
@@ -1311,6 +1312,7 @@ async function handleGetNotConnected(actor, body) {
   if (!agentCode) return { ok: false, error: 'AGENT_CODE_REQUIRED' };
   const agent = await findAgent(agentCode);
   if (!agent || !agent.spreadsheetId) return { ok: false, error: 'AGENT_NOT_FOUND' };
+  const usersVis = await getAllUsers();
   const { headers, rows } = await readSheet(agent.spreadsheetId, AGT.NC);
   const reqId = String(body.requestId || '');
   let result  = rows.map(r => { const o = {}; headers.forEach((h, i) => { o[h] = r[i]; }); return o; });

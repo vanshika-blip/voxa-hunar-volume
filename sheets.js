@@ -331,6 +331,24 @@ async function shareSpreadsheet(fileId, ...emails) {
   }
 }
 
+/**
+ * Batch-write multiple NON-CONTIGUOUS rows in ONE API call.
+ * updates = [{ rowIndex: number (1-based), values: any[] }]
+ * This replaces N individual writeRow calls with 1 batchUpdate — critical for quota.
+ */
+async function batchWriteRows(spreadsheetId, sheetName, updates) {
+  if (!updates.length) return;
+  const sheets = getSheetsClient();
+  const data = updates.map(u => ({
+    range: `'${sheetName}'!A${u.rowIndex}`,
+    values: [u.values],
+  }));
+  await withRetry(() => sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId,
+    requestBody: { valueInputOption: 'RAW', data },
+  }));
+}
+
 module.exports = {
   readRange,
   readSheet,
@@ -344,6 +362,7 @@ module.exports = {
   deleteRows,
   formatHeaderRow,
   testConnection,
+  batchWriteRows,
   createSpreadsheet,
   shareSpreadsheet,
   getAuth,
