@@ -663,7 +663,7 @@ async function _backfillAgent(agent) {
     await writeRow(agent.spreadsheetId || MAIN_SS_ID, mtName, i + 2, newRow);
     filled++;
 
-    // Mirror to QL if this call is there
+    // Mirror to QL if this call is already there (update result fields)
     if (qlCallIdCol >= 0 && qlRowByCallId[callId]) {
       const { rowIndex: qlRowIdx, row: qlRow } = qlRowByCallId[callId];
       const newQlRow = [...qlRow];
@@ -676,6 +676,32 @@ async function _backfillAgent(agent) {
         }
       });
       if (changed) await writeRow(agent.spreadsheetId || MAIN_SS_ID, qlName, qlRowIdx, newQlRow);
+    }
+
+    // ── KEY FIX: if not in QL yet but qualifies → add it now ──────────────
+    // This handles calls that were COMPLETED with no result data before,
+    // got skipped by poll's qualification check, now backfill filled the data.
+    else if (isQualified(agent, result)) {
+      const alreadyInQl = qlCallIdCol >= 0 && !!qlRowByCallId[callId];
+      if (!alreadyInQl) {
+        try {
+          // Build QL row from MT row
+          const qRow = new Array(qlHeaders.length).fill('');
+          qlHeaders.forEach((h, k) => {
+            const mi = mtHeaders.indexOf(h);
+            if (mi >= 0) qRow[k] = newRow[mi];
+          });
+          // Set date added if not already set
+          const dacIdx = qlHeaders.indexOf('Date Added');
+          if (dacIdx >= 0 && !qRow[dacIdx]) qRow[dacIdx] = new Date().toISOString();
+          await appendRows(agent.spreadsheetId || MAIN_SS_ID, qlName, [qRow]);
+          // Add to local index so we don't duplicate
+          qlRowByCallId[callId] = { rowIndex: qlRows.length + 2, row: qRow };
+          console.log(`[backfill] Qualified lead added to QL: ${callId} (${agent.agentCode})`);
+        } catch (e) {
+          console.warn(`[backfill] Could not add ${callId} to QL:`, e.message);
+        }
+      }
     }
 
     await sleep(400);
