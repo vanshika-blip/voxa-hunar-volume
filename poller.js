@@ -350,19 +350,30 @@ async function _pollAgent(agent, userRoleMap, triggerMap) {
   const { rows: ncRows } = await readSheet(agentSsId, ncName);
   const ncExistingIds = new Set(ncRows.map(r => String(r[0] || '').trim()).filter(Boolean));
 
-  // Load campaign statuses
-  const ctSheetName = agent.spreadsheetId ? AGT.CAMPAIGN_TRACKER : (agent.spreadsheetId ? AGT.CAMPAIGN_TRACKER : (agent.agentCode + AGT.CAMPAIGN_TRACKER));
+  // Load campaign statuses + triggered timestamps
+  const ctSheetName = agent.spreadsheetId ? AGT.CAMPAIGN_TRACKER : (agent.agentCode + AGT.CAMPAIGN_TRACKER);
   const { headers: ctHeaders, rows: ctRows } = await readSheet(agentSsId, ctSheetName);
-  const ctReqCol = ctHeaders.indexOf('Request ID');
-  const ctStatusCol = ctHeaders.indexOf('Status');
-  const campaignStatus = new Map();
-  if (ctReqCol >= 0 && ctStatusCol >= 0) {
+  const ctReqCol        = ctHeaders.indexOf('Request ID');
+  const ctStatusCol     = ctHeaders.indexOf('Status');
+  const ctTriggeredAtCol = ctHeaders.indexOf('Triggered At');
+  const campaignStatus      = new Map(); // reqId → status string
+  const campaignTriggeredAt = new Map(); // reqId → timestamp ms
+  if (ctReqCol >= 0) {
     ctRows.forEach(r => {
-      const rid = String(r[ctReqCol] || '');
-      const s = String(r[ctStatusCol] || 'IN_PROGRESS').toUpperCase();
-      if (rid) campaignStatus.set(rid, s);
+      const rid = String(r[ctReqCol] || '').trim();
+      if (!rid) return;
+      if (ctStatusCol >= 0) {
+        const s = String(r[ctStatusCol] || 'IN_PROGRESS').toUpperCase();
+        campaignStatus.set(rid, s);
+      }
+      if (ctTriggeredAtCol >= 0 && r[ctTriggeredAtCol]) {
+        const ms = new Date(r[ctTriggeredAtCol]).getTime();
+        if (!isNaN(ms)) campaignTriggeredAt.set(rid, ms);
+      }
     });
   }
+
+  const todayStr = istDateStr(); // 'YYYY-MM-DD' in IST, used for today-first sorting
 
   // Rows to write back
   const rowUpdates = []; // { rowIndex, values }
@@ -371,13 +382,16 @@ async function _pollAgent(agent, userRoleMap, triggerMap) {
   const ncDeletes  = []; // row indices to delete from NC
 
   // ── Priority-sorted processing ───────────────────────────────────────────
-  // 1. COMPLETED (missing result data) — highest priority, need results NOW
-  // 2. IN_PROGRESS — actively being processed
-  // 3. INITIATED   — queued, will start soon
-  // 4. SCHEDULED / NOT_STARTED — haven't started, lowest urgency
+  // Sort order (outermost → innermost):
+  //   1. TODAY's campaigns before previous days — ensures fresh triggers are never starved
+  //   2. Newest triggered campaign first — "last triggered → polled first → then previous"
+  //   3. Status urgency within the same campaign:
+  //        COMPLETED (missing results) → IN_PROGRESS → INITIATED → SCHEDULED → NOT_STARTED
+  //   4. Row index DESC (newest row in same campaign processed first)
   //
-  // Within each priority group: NEWEST rows first (bottom of sheet = most recent campaign)
-  // Cap at MAX_UPDATES_PER_AGENT so quota is never exceeded
+  // SCHEDULED/NOT_STARTED throttle: previous-day rows only (every 10th cycle).
+  //   Today's SCHEDULED/NOT_STARTED are always included so fresh campaigns aren't delayed.
+  // Cap at MAX_UPDATES_PER_AGENT to stay within Sheets quota.
 
   const rowPriority = (status, hasResult) => {
     if (status === 'COMPLETED' && !hasResult) return 0; // most urgent
@@ -397,9 +411,9 @@ async function _pollAgent(agent, userRoleMap, triggerMap) {
 
     const status = String(row[statusCol] || '').toUpperCase();
     const reqId  = reqIdCol >= 0 ? String(row[reqIdCol] || '') : '';
-    const campaignDone = reqId && campaignStatus.get(reqId) === 'COMPLETED';
+    const campaignDone = reqId ? campaignStatus.get(reqId) === 'COMPLETED' : false;
 
-    // Skip truly done rows
+    // Skip truly done rows (NOT_CONNECTED / CANCELLED / FAILED) whose campaign is finished
     if (FINAL_STATUSES.has(status) && status !== 'COMPLETED') {
       if (campaignDone) continue;
     }
@@ -414,24 +428,37 @@ async function _pollAgent(agent, userRoleMap, triggerMap) {
 
     const priority = rowPriority(status, hasResult);
 
-    // SCHEDULED/NOT_STARTED: only include every 10th cycle (sparse polling)
-    if (priority >= 3) {
+    // Resolve which day/campaign this row belongs to
+    const triggeredAtMs = reqId ? (campaignTriggeredAt.get(reqId) || 0) : 0;
+    const campaignDate  = triggeredAtMs ? istDateStr(new Date(triggeredAtMs)) : '';
+    const isToday       = campaignDate === todayStr;
+
+    // SCHEDULED/NOT_STARTED: throttle ONLY for previous-day campaigns (sparse polling every ~20 min)
+    // Today's SCHEDULED/NOT_STARTED are always included so a just-triggered campaign isn't delayed.
+    if (priority >= 3 && !isToday) {
       if ((_pollCycleCount % 10) !== (i % 10)) continue;
     }
 
-    candidates.push({ i, row, callId, status, reqId, priority, campaignDone });
+    candidates.push({ i, row, callId, status, reqId, priority, campaignDone, isToday, triggeredAtMs });
   }
 
-  // Sort: priority ASC, then row index DESC (newest first within same priority)
+  // Sort:
+  //   1. Today first (isToday DESC)
+  //   2. Newest campaign first (triggeredAtMs DESC) — "last triggered → polled first"
+  //   3. Status urgency (priority ASC)
+  //   4. Newest row in same campaign (row index DESC)
   candidates.sort((a, b) => {
-    if (a.priority !== b.priority) return a.priority - b.priority;
-    return b.i - a.i; // newest row (highest index) first
+    if (a.isToday !== b.isToday) return a.isToday ? -1 : 1;            // today before prev days
+    if (a.triggeredAtMs !== b.triggeredAtMs) return b.triggeredAtMs - a.triggeredAtMs; // newest campaign first
+    if (a.priority !== b.priority) return a.priority - b.priority;     // status urgency
+    return b.i - a.i;                                                  // newest row in campaign
   });
 
   // Take top N
   const toProcess = candidates.slice(0, MAX_UPDATES_PER_AGENT);
   if (candidates.length > MAX_UPDATES_PER_AGENT) {
-    console.log(`[poll] ${agent.agentCode}: ${candidates.length} pending, processing top ${MAX_UPDATES_PER_AGENT} (COMPLETED first, newest first)`);
+    const todayCount = candidates.filter(c => c.isToday).length;
+    console.log(`[poll] ${agent.agentCode}: ${candidates.length} pending (${todayCount} today), processing top ${MAX_UPDATES_PER_AGENT} (today-first, newest-campaign-first)`);
   }
 
   let updateCount = 0;
@@ -1254,8 +1281,9 @@ async function _fireRetryGroup(agent, team, originalReqId) {
 
 async function _seedMasterTracker(agent, createdCalls, requestId, triggeredBy) {
   if (!createdCalls.length) return;
+  const agentSsId = agent.spreadsheetId || MAIN_SS_ID;
   const mtName = agent.spreadsheetId ? AGT.MASTER_TRACKER : (agent.agentCode + AGT.MASTER_TRACKER);
-  const { headers, rows } = await readSheet(agent.spreadsheetId || MAIN_SS_ID, mtName);
+  const { headers, rows } = await readSheet(agentSsId, mtName);
   if (!headers.length) return;
 
   const cidCol = headers.indexOf('Call ID');
