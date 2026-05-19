@@ -305,15 +305,15 @@ function istDateStr(date = new Date()) {
 }
 
 /**
- * Returns true only between 08:00 and 21:00 IST.
- * Hunar operates 8am–8pm; we buffer to 9pm to catch late completions.
+ * Returns true only between 08:00 and 23:30 IST.
+ * Hunar operates 8am–8pm; we buffer to 11:30pm to catch all late completions.
  */
 function isPollingHours() {
   const ist = istNow();
-  const hours   = ist.getUTCHours();   // getUTCHours on IST-shifted date = IST hour
+  const hours   = ist.getUTCHours();
   const minutes = ist.getUTCMinutes();
   const timeMin = hours * 60 + minutes;
-  return timeMin >= 8 * 60 && timeMin < 21 * 60; // 08:00 → 21:00 IST
+  return timeMin >= 8 * 60 && timeMin < 23 * 60 + 30; // 08:00 → 23:30 IST
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
