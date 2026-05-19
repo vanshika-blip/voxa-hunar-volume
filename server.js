@@ -520,6 +520,11 @@ function slug(s) {
   return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 40);
 }
 
+// Matches GAS _toTabName — sanitise team name to valid sheet tab name
+function toTabName(raw) {
+  return String(raw || '').trim().replace(/[[\]*?:/\\]/g, '').slice(0, 99) || 'Sheet';
+}
+
 function defaultQualField(rs) {
   if (!rs || typeof rs !== 'object') return '';
   const keys = rs.properties ? Object.keys(rs.properties) : Object.keys(rs).filter(k => k !== 'type' && k !== 'required');
@@ -1154,18 +1159,19 @@ function _isInterviewLinedUp(val) {
 
 async function _addToLineupFromAI(actor, agent, row, headers, callId) {
   try {
+    if (!LINEUP_SS_ID) return;
     const users  = await getAllUsers();
     const actorF = users.find(u => u.email === actor.email);
     if (!actorF?.team) return;
-    const team = await findTeam(actorF.team);
-    if (!team?.spreadsheetId) return;
-    await _addToLineup(team.spreadsheetId, 'AI', { agent, row, headers, callId });
+    const tab = toTabName(actorF.team);
+    await _addToLineup(LINEUP_SS_ID, tab, 'AI', { agent, row, headers, callId });
   } catch (_) {}
 }
 
-async function _addToLineup(teamSsId, source, payload) {
-  await ensureSheet(teamSsId, TEAM_SH.LINEUP, LINEUP_H, '#5b21b6');
-  const { headers: h } = await readSheet(teamSsId, TEAM_SH.LINEUP);
+async function _addToLineup(teamSsId, teamTab, source, payload) {
+  const _tab = teamTab || TEAM_SH.LINEUP;
+  await ensureSheet(teamSsId, _tab, LINEUP_H, '#5b21b6');
+  const { headers: h } = await readSheet(teamSsId, _tab);
   const out  = {};
   LINEUP_H.forEach(hh => { out[hh] = ''; });
   let lookupId = '';
@@ -1213,11 +1219,11 @@ async function _addToLineup(teamSsId, source, payload) {
   }
 
   // Idempotency check
-  const { rows: existRows } = await readSheet(teamSsId, TEAM_SH.LINEUP);
+  const { rows: existRows } = await readSheet(teamSsId, _tab);
   const cc = h.indexOf('Call ID');
   if (cc >= 0 && existRows.some(r => String(r[cc] || '').trim() === lookupId)) return { ok: true, action: 'exists' };
   const rowVals = h.map(hh => out[hh] !== undefined ? out[hh] : '');
-  await appendRows(teamSsId, TEAM_SH.LINEUP, [rowVals]);
+  await appendRows(teamSsId, _tab, [rowVals]);
   return { ok: true, action: 'appended' };
 }
 
@@ -1557,26 +1563,36 @@ async function handleGetUsage(actor) {
 
 // ─── Manual Tracker ────────────────────────────────────────────────────────────
 async function handleGetManualTracker(actor, body) {
+  // Read from Central Manual Tracker SS (one sheet per team)
+  const ssId = MANUAL_TRACKER_SS_ID;
+  if (!ssId) return { ok: false, error: 'MANUAL_TRACKER_SS_ID not set in env vars' };
+
   const teamName = actor.role === 'super_admin' ? String(body.team || '') : actor.team;
-  if (!teamName && actor.role !== 'super_admin') return { ok: true, rows: [] };
+
   if (!teamName) {
-    // Super admin: all teams
-    const teams = await getAllTeams(); const all = [];
+    // Super admin with no team filter — read all team sheets
+    const teams = await getAllTeams();
+    const all = [];
     for (const t of teams) {
-      if (!t.spreadsheetId) continue;
+      if (!t.name) continue;
       try {
-        const { headers, rows } = await readSheet(t.spreadsheetId, TEAM_SH.MANUAL);
+        const tab = toTabName(t.name);
+        const { headers, rows } = await readSheet(ssId, tab);
         rows.forEach(r => { const o = { _team: t.name }; headers.forEach((h, i) => { o[h] = r[i]; }); if (o['Unique ID']) all.push(o); });
       } catch (_) {}
     }
     return { ok: true, rows: all };
   }
-  const team = await findTeam(teamName);
-  if (!team?.spreadsheetId) return { ok: true, rows: [] };
-  const { headers, rows } = await readSheet(team.spreadsheetId, TEAM_SH.MANUAL);
-  let data = rows.map(r => { const o = {}; headers.forEach((h, i) => { o[h] = r[i]; }); return o; }).filter(r => r['Unique ID']);
-  if (actor.role === 'recruiter') data = data.filter(r => String(r['Added By Email'] || '').toLowerCase() === actor.email);
-  return { ok: true, rows: data };
+
+  try {
+    const tab = toTabName(teamName);
+    const { headers, rows } = await readSheet(ssId, tab);
+    let data = rows.map(r => { const o = {}; headers.forEach((h, i) => { o[h] = r[i]; }); return o; }).filter(r => r['Unique ID']);
+    if (actor.role === 'recruiter') data = data.filter(r => String(r['Added By Email'] || '').toLowerCase() === actor.email);
+    return { ok: true, rows: data };
+  } catch (e) {
+    return { ok: false, error: 'Could not read manual tracker: ' + e.message };
+  }
 }
 
 async function handleAddManualEntry(actor, body) {
@@ -1589,13 +1605,16 @@ async function handleAddManualEntry(actor, body) {
   if (!teamName) return { ok: false, error: 'NO_TEAM' };
   const team = await findTeam(teamName);
   if (!team?.spreadsheetId) return { ok: false, error: 'TEAM_NO_SPREADSHEET' };
-  await ensureSheet(team.spreadsheetId, TEAM_SH.MANUAL, MANUAL_H, '#0369a1');
+  const ssId = MANUAL_TRACKER_SS_ID;
+  if (!ssId) return { ok: false, error: 'MANUAL_TRACKER_SS_ID not set in env vars' };
+  const tab = toTabName(teamName);
+  await ensureSheet(ssId, tab, MANUAL_H, '#0369a1');
   const now = new Date();
   const uid = `MT_${now.toISOString().slice(0,19).replace(/[-:T]/g,'')}_ ${actor.email.split('@')[0].slice(0,6).toUpperCase()}`.replace(/\s/g,'');
   let dv = now;
   try { if (entry.date) dv = new Date(entry.date); } catch (_) {}
   const row = [uid, dv.toISOString(), name, phone, entry.location || '', entry.client || '', entry.role || '', entry.source || '', '', '', '', actor.email, actor.name || actor.email, teamName, false, now.toISOString()];
-  await appendRows(team.spreadsheetId, TEAM_SH.MANUAL, [row]);
+  await appendRows(ssId, tab, [row]);
   audit(actor.email, 'add_manual_entry', uid, name).catch(() => {});
   return { ok: true, uniqueId: uid };
 }
@@ -1605,9 +1624,10 @@ async function handleUpdateManualEntry(actor, body) {
   if (!uid) return { ok: false, error: 'UNIQUE_ID_REQUIRED' };
   const teamName = actor.role === 'super_admin' ? String(body.team || '') : actor.team;
   if (!teamName) return { ok: false, error: 'NO_TEAM' };
-  const team = await findTeam(teamName);
-  if (!team?.spreadsheetId) return { ok: false, error: 'TEAM_NOT_FOUND' };
-  const { headers, rows } = await readSheet(team.spreadsheetId, TEAM_SH.MANUAL);
+  const ssId = MANUAL_TRACKER_SS_ID;
+  if (!ssId) return { ok: false, error: 'MANUAL_TRACKER_SS_ID not set' };
+  const tab = toTabName(teamName);
+  const { headers, rows } = await readSheet(ssId, tab);
   const idCol = headers.indexOf('Unique ID');
   if (idCol < 0) return { ok: false, error: 'MISSING_ID_COL' };
   const ALLOWED = ['Call Status','Lined-up','Remarks','Candidate Name','Contact Number','Client','Role','Source','Location','Date'];
@@ -1623,14 +1643,14 @@ async function handleUpdateManualEntry(actor, body) {
       if (k === 'Date' && v) { try { v = new Date(v).toISOString(); } catch (_) {} }
       newRow[col] = v;
     });
-    await writeRow(team.spreadsheetId, TEAM_SH.MANUAL, i + 2, newRow);
+    await writeRow(ssId, tab, i + 2, newRow);
     // Lineup hook
     if (String(fields['Lined-up'] || '').toLowerCase().trim() === 'yes') {
       const entry = {};
       headers.forEach((h, j) => { entry[h] = newRow[j]; });
-      _addToLineup(team.spreadsheetId, 'Manual', { entry, uniqueId: uid }).catch(() => {});
+      _addToLineup(LINEUP_SS_ID, tab, 'Manual', { entry, uniqueId: uid }).catch(() => {});
       const ilCol = headers.indexOf('In Lineup');
-      if (ilCol >= 0) { newRow[ilCol] = true; await writeRow(team.spreadsheetId, TEAM_SH.MANUAL, i + 2, newRow); }
+      if (ilCol >= 0) { newRow[ilCol] = true; await writeRow(ssId, tab, i + 2, newRow); }
     }
     return { ok: true, rejected };
   }
@@ -1639,26 +1659,36 @@ async function handleUpdateManualEntry(actor, body) {
 
 // ─── Interview Lineup ─────────────────────────────────────────────────────────
 async function handleGetInterviewLineup(actor, body) {
+  const ssId = LINEUP_SS_ID;
+  if (!ssId) return { ok: false, error: 'LINEUP_SS_ID not set in env vars' };
+
   const teamName = actor.role === 'super_admin' ? String(body.team || '') : actor.team;
-  if (!teamName && actor.role !== 'super_admin') return { ok: true, rows: [], headers: [] };
+
   if (!teamName) {
-    const teams = await getAllTeams(); const all = []; let headers = [];
+    // Super admin with no filter — read all team sheets
+    const teams = await getAllTeams();
+    const all = []; let sharedHeaders = [];
     for (const t of teams) {
-      if (!t.spreadsheetId) continue;
+      if (!t.name) continue;
       try {
-        const { headers: h, rows } = await readSheet(t.spreadsheetId, TEAM_SH.LINEUP);
-        if (!headers.length) headers = h;
+        const tab = toTabName(t.name);
+        const { headers: h, rows } = await readSheet(ssId, tab);
+        if (!sharedHeaders.length) sharedHeaders = h;
         rows.forEach(r => { const o = { _team: t.name }; h.forEach((hh, i) => { o[hh] = r[i]; }); if (o['Call ID']) all.push(o); });
       } catch (_) {}
     }
-    return { ok: true, rows: all, headers };
+    return { ok: true, rows: all, headers: sharedHeaders };
   }
-  const team = await findTeam(teamName);
-  if (!team?.spreadsheetId) return { ok: true, rows: [], headers: [] };
-  const { headers, rows } = await readSheet(team.spreadsheetId, TEAM_SH.LINEUP);
-  let data = rows.map(r => { const o = {}; headers.forEach((h, i) => { o[h] = r[i]; }); return o; }).filter(r => r['Call ID']);
-  if (actor.role === 'recruiter') data = data.filter(r => String(r['Assigned Recruiter Email'] || '').toLowerCase() === actor.email);
-  return { ok: true, rows: data, headers };
+
+  try {
+    const tab = toTabName(teamName);
+    const { headers, rows } = await readSheet(ssId, tab);
+    let data = rows.map(r => { const o = {}; headers.forEach((h, i) => { o[h] = r[i]; }); return o; }).filter(r => r['Call ID']);
+    if (actor.role === 'recruiter') data = data.filter(r => String(r['Assigned Recruiter Email'] || '').toLowerCase() === actor.email);
+    return { ok: true, rows: data, headers };
+  } catch (e) {
+    return { ok: false, error: 'Could not read lineup: ' + e.message };
+  }
 }
 
 async function handleUpdateInterviewLead(actor, body) {
@@ -1666,9 +1696,10 @@ async function handleUpdateInterviewLead(actor, body) {
   if (!callId) return { ok: false, error: 'CALL_ID_REQUIRED' };
   const teamName = actor.role === 'super_admin' ? String(body.team || '') : actor.team;
   if (!teamName) return { ok: false, error: 'NO_TEAM' };
-  const team = await findTeam(teamName);
-  if (!team?.spreadsheetId) return { ok: false, error: 'NO_TEAM_SS' };
-  const { headers, rows } = await readSheet(team.spreadsheetId, TEAM_SH.LINEUP);
+  const lineupSsId = LINEUP_SS_ID;
+  if (!lineupSsId) return { ok: false, error: 'LINEUP_SS_ID not set' };
+  const lineupTab = toTabName(teamName);
+  const { headers, rows } = await readSheet(lineupSsId, lineupTab);
   const cc = headers.indexOf('Call ID');
   if (cc < 0) return { ok: false, error: 'NO_CALL_ID_COL' };
   const ALLOWED = ['Selection Process','Turnup Status','Email','DOB','Qualification','Work Experience','Current CTC','Expected CTC','Notice Period','Role','Location','CIBIL Score','SPOC Name','Current Employer','CV Link'];
@@ -1680,7 +1711,7 @@ async function handleUpdateInterviewLead(actor, body) {
       if (!ALLOWED.includes(k)) { rejected.push(k); return; }
       const col = headers.indexOf(k); if (col >= 0) newRow[col] = body.fields[k];
     });
-    await writeRow(team.spreadsheetId, TEAM_SH.LINEUP, i + 2, newRow);
+    await writeRow(lineupSsId, lineupTab, i + 2, newRow);
     return { ok: true, rejected };
   }
   return { ok: false, error: 'NOT_FOUND' };
