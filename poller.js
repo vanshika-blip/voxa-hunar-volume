@@ -64,6 +64,8 @@ const CB_KEYWORDS = ['call back', 'callback', 'call-back', 'ring back', 'follow 
 
 let pollRunning   = false;
 let _pollCycleCount = 0; // increments each poll run, used for SCHEDULED throttling
+const _agentCursors = {}; // { agentCode: lastRowIndex } — tracks where each agent left off
+const MAX_UPDATES_PER_AGENT = 50; // max rows to update per agent per poll cycle
 let lastPollTime  = null;
 let lastPollStats = {};
 let jobStats      = {};
@@ -306,8 +308,8 @@ async function pollActiveBatches(agentCodeFilter = null) {
         const stats = await _pollAgent(agent, userRoleMap, triggerMap);
         lastPollStats[agent.agentCode] = stats;
         console.log(`[poll] ${agent.agentCode}: fetched=${stats.fetched} updated=${stats.updated} errors=${stats.errors} ql=${stats.qlAdded}`);
-        // Brief pause between agents to spread quota usage
-        await sleep(800);
+        // Brief pause between agents to spread quota usage (quota = 60 writes/min)
+        await sleep(1200);
       } catch (err) {
         console.error(`[poll] Error on ${agent.agentCode}:`, err.message);
       }
@@ -369,7 +371,22 @@ async function _pollAgent(agent, userRoleMap, triggerMap) {
   const ncAppends  = []; // arrays to append
   const ncDeletes  = []; // row indices to delete from NC
 
-  for (let i = 0; i < mtRows.length; i++) {
+  // Resume from where we left off last cycle (cursor-based processing)
+  const agentKey = agent.agentCode;
+  const startIdx = _agentCursors[agentKey] || 0;
+  let updateCount = 0;
+  let reachedEnd  = true;
+
+  for (let i = startIdx; i < mtRows.length; i++) {
+    // Cap: stop after MAX_UPDATES_PER_AGENT actual updates this cycle
+    if (updateCount >= MAX_UPDATES_PER_AGENT) {
+      // Save cursor so next cycle continues from here
+      _agentCursors[agentKey] = i;
+      reachedEnd = false;
+      console.log(`[poll] ${agent.agentCode}: cap reached at row ${i}/${mtRows.length}, resuming next cycle`);
+      break;
+    }
+
     const row    = mtRows[i];
     const callId = String(row[callIdCol] || '').trim();
     const status = String(row[statusCol] || '').toUpperCase();
@@ -390,12 +407,8 @@ async function _pollAgent(agent, userRoleMap, triggerMap) {
       continue;
     }
 
-    // ── QUOTA OPTIMISATION ──────────────────────────────────────────────────
-    // SCHEDULED / NOT_STARTED = Hunar hasn't dialed yet.
-    // Polling them every 2 min wastes quota (1450 rows = 7+ min per cycle).
-    // Only poll them every 10th cycle (~20 min) to detect any state change.
+    // SCHEDULED / NOT_STARTED: only check every 10th cycle
     if (status === 'SCHEDULED' || status === 'NOT_STARTED') {
-      // Use row index as a cheap spread factor so not all of them hit the same cycle
       const cycleSlot = i % 10;
       if ((_pollCycleCount % 10) !== cycleSlot) continue;
     }
@@ -440,6 +453,7 @@ async function _pollAgent(agent, userRoleMap, triggerMap) {
 
     rowUpdates.push({ rowIndex: i + 2, values: newRow }); // +2: header row + 1-based
     stats.updated++;
+    updateCount++;
 
     // QL: push qualified leads
     if (newStatus === 'COMPLETED' && !qlExistingIds.has(callId) && isQualified(agent, result)) {
@@ -491,6 +505,9 @@ async function _pollAgent(agent, userRoleMap, triggerMap) {
     // Throttle: 1 Hunar API call per 150ms (safe at ~6 req/sec)
     await sleep(150);
   }
+
+  // Reset cursor if we processed all rows
+  if (reachedEnd) _agentCursors[agentKey] = 0;
 
   // Flush all writes — ONE batchUpdate call instead of N individual writes
   // This is the key quota fix: N rows = 1 API call, not N API calls
