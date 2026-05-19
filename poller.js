@@ -419,7 +419,7 @@ async function _pollAgent(agent, userRoleMap, triggerMap) {
       if ((_pollCycleCount % 10) !== (i % 10)) continue;
     }
 
-    candidates.push({ i, row, callId, status, reqId, priority });
+    candidates.push({ i, row, callId, status, reqId, priority, campaignDone });
   }
 
   // Sort: priority ASC, then row index DESC (newest first within same priority)
@@ -436,7 +436,7 @@ async function _pollAgent(agent, userRoleMap, triggerMap) {
 
   let updateCount = 0;
 
-  for (const { i, row, callId, status, reqId } of toProcess) {
+  for (const { i, row, callId, status, reqId, campaignDone } of toProcess) {
 
     // Fetch from Hunar
     stats.fetched++;
@@ -611,8 +611,9 @@ async function _refreshCampaignTracker(agent, agentSsId, mtHeaders, mtRows) {
       updates.push({ rowIndex: idx + 2, values: newRow });
     });
 
-    for (const u of updates) {
-      await writeRow(agent.spreadsheetId || MAIN_SS_ID, ctName, u.rowIndex, u.values);
+    // Single batchWriteRows call instead of N individual writes (quota fix)
+    if (updates.length) {
+      await batchWriteRows(agent.spreadsheetId || MAIN_SS_ID, ctName, updates);
     }
   } catch (err) {
     console.error(`[poll] refreshCampaignTracker error on ${agent.agentCode}:`, err.message);
