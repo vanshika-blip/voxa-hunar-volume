@@ -454,13 +454,27 @@ async function _pollAgent(agent, userRoleMap, triggerMap) {
     return b.i - a.i;                                                  // newest row in campaign
   });
 
-  // Take top N
-  const toProcess = candidates.slice(0, MAX_UPDATES_PER_AGENT);
-  if (candidates.length > MAX_UPDATES_PER_AGENT) {
-    const todayCount = candidates.filter(c => c.isToday).length;
-    console.log(`[poll] ${agent.agentCode}: ${candidates.length} pending (${todayCount} today), processing top ${MAX_UPDATES_PER_AGENT} (today-first, newest-campaign-first)`);
+  // ── Two-pass split ────────────────────────────────────────────────────────
+  // Pass 1 — URGENT (uncapped): COMPLETED rows with eval/result still missing.
+  //   These are fetched NO MATTER WHAT — no row cap, no sequence dependency.
+  //   A call that just finished must get its result data this cycle, not next.
+  //
+  // Pass 2 — NORMAL (capped at MAX_UPDATES_PER_AGENT): everything else.
+  //   Today-first, newest-campaign-first, status priority, row index.
+
+  const urgentPass  = candidates.filter(c => c.priority === 0); // COMPLETED, no eval
+  const normalCandidates = candidates.filter(c => c.priority !== 0);
+  const normalPass  = normalCandidates.slice(0, MAX_UPDATES_PER_AGENT);
+
+  if (urgentPass.length > 0) {
+    console.log(`[poll] ${agent.agentCode}: ${urgentPass.length} COMPLETED+eval-missing — fetching ALL (uncapped)`);
+  }
+  if (normalPass.length < normalCandidates.length) {
+    const todayCount = normalCandidates.filter(c => c.isToday).length;
+    console.log(`[poll] ${agent.agentCode}: ${normalCandidates.length} normal pending (${todayCount} today), processing top ${MAX_UPDATES_PER_AGENT}`);
   }
 
+  const toProcess = [...urgentPass, ...normalPass];
   let updateCount = 0;
 
   for (const { i, row, callId, status, reqId, campaignDone } of toProcess) {
@@ -571,6 +585,91 @@ async function _pollAgent(agent, userRoleMap, triggerMap) {
   if (qlAppends.length) await appendRows(agentSsId, qlName, qlAppends);
   if (ncAppends.length) await appendRows(agentSsId, ncName, ncAppends);
   if (ncDeletes.length) await deleteRows(agentSsId, ncName, ncDeletes);
+
+  // ── Immediate eval re-fetch pass ─────────────────────────────────────────
+  // Hunar sometimes writes eval/result data a few seconds AFTER status=COMPLETED.
+  // When we detect a row that just flipped to COMPLETED but came back with empty result,
+  // we wait 5s and re-fetch it inline — instead of waiting the full 2-min cycle.
+  // Cap at 20 calls so this never becomes a runaway quota drain.
+  const evalPending = rowUpdates.filter(({ values }) => {
+    const st = values[statusCol];
+    if (st !== 'COMPLETED') return false;
+    return resultFields.every(f => {
+      const col = mtHeaders.indexOf('out.' + f);
+      return col < 0 || String(values[col] || '').trim() === '';
+    });
+  });
+
+  if (evalPending.length > 0) {
+    console.log(`[poll] ${agent.agentCode}: ${evalPending.length} calls COMPLETED but eval empty — re-fetching in 5s`);
+    await sleep(5000); // give Hunar's eval pipeline a moment to settle
+
+    const evalUpdates   = [];
+    const evalQlAppends = [];
+
+    for (const { rowIndex, values } of evalPending.slice(0, 20)) {
+      const callId = String(values[callIdCol] || '').trim();
+      if (!callId) continue;
+
+      await sleep(200);
+      const r2 = await getCall(callId);
+      if (!r2.ok) continue;
+
+      const d2      = r2.data;
+      const result2 = d2.result || {};
+      const hasEval = resultFields.some(f => result2[f] !== undefined && result2[f] !== '');
+      if (!hasEval) continue; // still not ready — priority-0 will catch it next cycle
+
+      const newRow = [...values];
+      const setH2  = (name, val) => { const k = mtHeaders.indexOf(name); if (k >= 0) newRow[k] = val; };
+      setH2('Duration (Minutes)', d2.duration_minutes ?? values[mtHeaders.indexOf('Duration (Minutes)')] ?? 0);
+      setH2('Duration (Seconds)', d2.duration_seconds ?? values[mtHeaders.indexOf('Duration (Seconds)')] ?? 0);
+      setH2('Ended At',           d2.ended_at   || values[mtHeaders.indexOf('Ended At')]   || '');
+      setH2('Answered By',        d2.answered_by || values[mtHeaders.indexOf('Answered By')] || '');
+      setH2('Recording URL',      d2.recording_url || values[mtHeaders.indexOf('Recording URL')] || '');
+      setH2('Updated At',         new Date().toISOString());
+      resultFields.forEach(f => setH2('out.' + f, result2[f] !== undefined ? result2[f] : ''));
+      customVars.forEach(cv => { if (d2.custom_data?.[cv] !== undefined) setH2('in.' + cv, d2.custom_data[cv]); });
+
+      evalUpdates.push({ rowIndex, values: newRow });
+      stats.updated++;
+
+      // QL: push qualified leads discovered in this re-fetch pass
+      if (!qlExistingIds.has(callId) && isQualified(agent, result2)) {
+        const reqId2     = reqIdCol >= 0 ? String(values[reqIdCol] || '') : '';
+        const mobileCol2 = mtHeaders.indexOf('Mobile Number');
+        const mobile2    = mobileCol2 >= 0 ? String(values[mobileCol2] || '') : '';
+        const assignment = resolveLeadAssignment(reqId2, agent.agentCode, mobile2, values, mtHeaders, userRoleMap, triggerMap);
+
+        const qlRow = new Array(qlHeaders.length).fill('');
+        qlHeaders.forEach((h, k) => { const mi = mtHeaders.indexOf(h); if (mi >= 0) qlRow[k] = newRow[mi]; });
+        const qlAssignCol    = qlHeaders.indexOf('Assigned To Email');
+        const qlRecruiterCol = qlHeaders.indexOf('Recruiter');
+        const qlDateAddedCol = qlHeaders.indexOf('Date Added');
+        if (assignment.assignEmail) {
+          if (qlAssignCol >= 0)    qlRow[qlAssignCol]    = assignment.assignEmail;
+          if (qlRecruiterCol >= 0) qlRow[qlRecruiterCol] = assignment.recruiterName;
+        }
+        if (qlDateAddedCol >= 0) qlRow[qlDateAddedCol] = new Date().toISOString();
+
+        evalQlAppends.push(qlRow);
+        qlExistingIds.add(callId);
+        stats.qlAdded++;
+      }
+    }
+
+    if (evalUpdates.length) {
+      // Also update rowUpdates so _refreshCampaignTracker below sees the final values
+      evalUpdates.forEach(eu => {
+        const existing = rowUpdates.find(u => u.rowIndex === eu.rowIndex);
+        if (existing) existing.values = eu.values;
+        else rowUpdates.push(eu);
+      });
+      await batchWriteRows(agentSsId, mtName, evalUpdates);
+      console.log(`[poll] ${agent.agentCode}: eval re-fetch filled ${evalUpdates.length}/${evalPending.length}`);
+    }
+    if (evalQlAppends.length) await appendRows(agentSsId, qlName, evalQlAppends);
+  }
 
   // Refresh campaign tracker
   if (stats.updated > 0) await _refreshCampaignTracker(agent, agentSsId, mtHeaders, mtRows.map((r, i) => {
