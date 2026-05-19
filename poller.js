@@ -18,6 +18,11 @@
  *   2. _refreshCampaignTracker merge uses Map lookup O(n) — was O(n²) .find() inside .map()
  *   3. Large merged array explicitly cleared after use to aid GC
  *   4. Fixed dedupe bug: was referencing undefined `dedupeSsId` variable
+ *
+ * POLLING FIXES (v2.2):
+ *   5. Time gate: only poll between 8:00am–9:00pm IST (Hunar operates 8am–8pm, buffer till 9pm)
+ *   6. New priority order: COMPLETED(no eval) → IN_PROGRESS → INITIATED → SCHEDULED → NOT_STARTED
+ *      Terminal statuses (NOT_CONNECTED, FAILED, CANCELLED) are skipped entirely — Hunar never updates them again
  */
 
 const cron = require('node-cron');
@@ -299,6 +304,18 @@ function istDateStr(date = new Date()) {
   return ist.toISOString().slice(0, 10);
 }
 
+/**
+ * Returns true only between 08:00 and 21:00 IST.
+ * Hunar operates 8am–8pm; we buffer to 9pm to catch late completions.
+ */
+function isPollingHours() {
+  const ist = istNow();
+  const hours   = ist.getUTCHours();   // getUTCHours on IST-shifted date = IST hour
+  const minutes = ist.getUTCMinutes();
+  const timeMin = hours * 60 + minutes;
+  return timeMin >= 8 * 60 && timeMin < 21 * 60; // 08:00 → 21:00 IST
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // JOB 1: POLL ACTIVE BATCHES
 // Fetches call statuses from Hunar API, updates Master Tracker,
@@ -308,6 +325,11 @@ function istDateStr(date = new Date()) {
 async function pollActiveBatches(agentCodeFilter = null) {
   if (pollRunning) {
     console.log('[poll] Skipping — still running.');
+    return;
+  }
+  // Time gate: only poll 8am–9pm IST
+  if (!agentCodeFilter && !isPollingHours()) {
+    console.log('[poll] Outside polling hours (8am–9pm IST) — skipping.');
     return;
   }
   pollRunning = true;
@@ -417,12 +439,12 @@ async function _pollAgent(agent, userRoleMap, triggerMap) {
   // Cap at MAX_UPDATES_PER_AGENT to stay within Sheets quota.
 
   const rowPriority = (status, hasResult) => {
-    if (status === 'COMPLETED' && !hasResult) return 0; // most urgent
+    if (status === 'COMPLETED' && !hasResult) return 0; // urgent — get eval data
     if (status === 'IN_PROGRESS')             return 1;
     if (status === 'INITIATED')               return 2;
-    if (status === 'SCHEDULED')               return 3;
+    if (status === 'SCHEDULED')               return 3; // check these → may have become NC/FAILED/COMPLETED
     if (status === 'NOT_STARTED')             return 4;
-    return 5;
+    return 99; // terminal status — skip
   };
 
   // Build candidate list
@@ -436,10 +458,9 @@ async function _pollAgent(agent, userRoleMap, triggerMap) {
     const reqId  = reqIdCol >= 0 ? String(row[reqIdCol] || '') : '';
     const campaignDone = reqId ? campaignStatus.get(reqId) === 'COMPLETED' : false;
 
-    // Skip truly done rows (NOT_CONNECTED / CANCELLED / FAILED) whose campaign is finished
-    if (FINAL_STATUSES.has(status) && status !== 'COMPLETED') {
-      if (campaignDone) continue;
-    }
+    // Skip ALL terminal statuses — NOT_CONNECTED, FAILED, CANCELLED never get updated by Hunar again
+    // We discover these by polling SCHEDULED/INITIATED/IN_PROGRESS rows instead
+    if (status === 'NOT_CONNECTED' || status === 'FAILED' || status === 'CANCELLED') continue;
 
     const hasResult = status === 'COMPLETED' && resultFields.some(f => {
       const col = mtHeaders.indexOf('out.' + f);

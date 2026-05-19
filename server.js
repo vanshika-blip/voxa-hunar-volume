@@ -2153,4 +2153,14 @@ app.get('*', (req, res) => {
 app.listen(PORT, () => {
   console.log(`[server] Voxa Portal running on port ${PORT} — all logic in Node, no GAS proxy`);
   startPoller();
+
+  // Keepalive: self-ping every 5 min so Render free tier never spins down
+  // After 6pm when Hunar stops calls, light traffic would trigger sleep without this
+  const cron = require('node-cron');
+  cron.schedule('*/5 * * * *', async () => {
+    try {
+      await axios.get(`http://localhost:${PORT}/health`, { timeout: 5000 });
+    } catch (_) {}
+  });
+  console.log('[server] Keepalive ping scheduled (every 5 min) ✓');
 });
