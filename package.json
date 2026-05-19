@@ -1,13 +1,13 @@
 {
   "name": "voxa-portal",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Voxa Portal Node Server — all background jobs + archive API",
   "main": "server.js",
   "engines": {
     "node": ">=18"
   },
   "scripts": {
-    "start": "node server.js",
+    "start": "node --max-old-space-size=400 server.js",
     "dev": "node --watch server.js"
   },
   "dependencies": {

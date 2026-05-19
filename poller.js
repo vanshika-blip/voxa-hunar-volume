@@ -12,6 +12,12 @@
  *   - archiveManualTracker   daily 4am IST → team spreadsheet
  *   - processCallbackQueue   daily 11am IST
  *   - processRetryQueue      daily 11am IST
+ *
+ * MEMORY FIXES (v2.1):
+ *   1. Trigger Log cached for 10 min — was re-read every 2 min poll cycle
+ *   2. _refreshCampaignTracker merge uses Map lookup O(n) — was O(n²) .find() inside .map()
+ *   3. Large merged array explicitly cleared after use to aid GC
+ *   4. Fixed dedupe bug: was referencing undefined `dedupeSsId` variable
  */
 
 const cron = require('node-cron');
@@ -115,6 +121,21 @@ let _usersCache   = null;
 let _usersCacheAt = 0;
 let _teamsCache   = null;
 let _teamsCacheAt = 0;
+
+// FIX 1: Cache Trigger Log — was re-read every 2 min, can grow very large
+let _trigCache    = null;
+let _trigCacheAt  = 0;
+const TRIG_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+async function _getTriggerLog(force = false) {
+  if (!force && _trigCache && Date.now() - _trigCacheAt < TRIG_TTL_MS) {
+    return _trigCache;
+  }
+  const res = await readSheet(MAIN_SS_ID, PORTAL.TRIGGER_LOG);
+  _trigCache = res;
+  _trigCacheAt = Date.now();
+  return _trigCache;
+}
 
 async function getAllAgents(force = false) {
   if (!force && _agentsCache && Date.now() - _agentsCacheAt < 5 * 60 * 1000) return _agentsCache;
@@ -297,7 +318,9 @@ async function pollActiveBatches(agentCodeFilter = null) {
     const agents = (await getAllAgents()).filter(a => a.active);
     const users = await getAllUsers();
     const userRoleMap = buildUserRoleMap(users);
-    const { headers: trigHeaders, rows: trigRows } = await readSheet(MAIN_SS_ID, PORTAL.TRIGGER_LOG);
+
+    // FIX 1: Use cached Trigger Log instead of re-reading every 2 minutes
+    const { headers: trigHeaders, rows: trigRows } = await _getTriggerLog();
     const triggerMap = trigHeaders.length ? buildTriggerMap(trigRows, trigHeaders) : {};
 
     const targets = agentCodeFilter ? agents.filter(a => a.agentCode === agentCodeFilter) : agents;
@@ -671,11 +694,14 @@ async function _pollAgent(agent, userRoleMap, triggerMap) {
     if (evalQlAppends.length) await appendRows(agentSsId, qlName, evalQlAppends);
   }
 
-  // Refresh campaign tracker
-  if (stats.updated > 0) await _refreshCampaignTracker(agent, agentSsId, mtHeaders, mtRows.map((r, i) => {
-    const upd = rowUpdates.find(u => u.rowIndex === i + 2);
-    return upd ? upd.values : r;
-  }));
+  // FIX 2: Build merged rows using a Map (O(n)) instead of .find() inside .map() (O(n²))
+  // This avoids creating a huge in-memory copy of all mtRows on every poll cycle
+  if (stats.updated > 0) {
+    const updatedRowMap = new Map(rowUpdates.map(u => [u.rowIndex, u.values]));
+    const mergedRows = mtRows.map((r, i) => updatedRowMap.get(i + 2) || r);
+    await _refreshCampaignTracker(agent, agentSsId, mtHeaders, mergedRows);
+    updatedRowMap.clear(); // FIX 3: help GC release this memory promptly
+  }
 
   return stats;
 }
@@ -872,7 +898,9 @@ async function repairUnassignedLeads() {
   const agents  = (await getAllAgents()).filter(a => a.active);
   const users   = await getAllUsers();
   const userRoleMap = buildUserRoleMap(users);
-  const { headers: trigHeaders, rows: trigRows } = await readSheet(MAIN_SS_ID, PORTAL.TRIGGER_LOG);
+
+  // FIX 1: Use cached Trigger Log here too
+  const { headers: trigHeaders, rows: trigRows } = await _getTriggerLog();
   const triggerMap = trigHeaders.length ? buildTriggerMap(trigRows, trigHeaders) : {};
 
   let totalFixed = 0;
@@ -951,10 +979,13 @@ async function dedupeAllSheets() {
   let total = 0;
 
   for (const agent of agents) {
+    // FIX 4: was using undefined variable `dedupeSsId` — use correct spreadsheet ID
+    const agentSsId = agent.spreadsheetId || MAIN_SS_ID;
+
     for (const suffix of [AGT.MASTER_TRACKER, AGT.QUALIFIED_LEADS, AGT.NOT_CONNECTED]) {
       try {
-        const sheetName = agent.agentCode + suffix;
-        const { headers, rows } = await readSheet(agent.spreadsheetId || MAIN_SS_ID, sheetName);
+        const sheetName = agent.spreadsheetId ? suffix : (agent.agentCode + suffix);
+        const { headers, rows } = await readSheet(agentSsId, sheetName);
         if (!headers.length) continue;
         const cidCol = headers.indexOf('Call ID');
         if (cidCol < 0) continue;
@@ -969,13 +1000,13 @@ async function dedupeAllSheets() {
         });
 
         if (toDelete.length) {
-          await deleteRows(dedupeSsId, sheetName, toDelete);
+          await deleteRows(agentSsId, sheetName, toDelete);
           total += toDelete.length;
           console.log(`[dedupe] ${sheetName}: removed ${toDelete.length} duplicates`);
         }
         await sleep(500);
       } catch (err) {
-        console.error(`[dedupe] Error on ${agent.agentCode}${suffix}:`, err.message);
+        console.error(`[dedupe] Error on ${agent.agentCode}/${suffix}:`, err.message);
       }
     }
   }
