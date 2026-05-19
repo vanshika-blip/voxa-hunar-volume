@@ -1007,6 +1007,7 @@ async function handleUploadContacts(actor, body) {
   if (!agent.active)        return { ok: false, error: 'AGENT_INACTIVE' };
   if (!agent.spreadsheetId) return { ok: false, error: 'AGENT_NO_SPREADSHEET' };
   const agents = await getAllAgents();
+  const usersVis = await getAllUsers();
   if (!agentsVisibleTo(actor, agents, usersVis).find(a => a.agentCode === agentCode)) return { ok: false, error: 'AGENT_NOT_VISIBLE' };
 
   const estMin = rows.length * agent.estSecondsPerCall / 60;
