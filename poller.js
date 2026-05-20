@@ -75,10 +75,148 @@ const CB_KEYWORDS = ['call back', 'callback', 'call-back', 'ring back', 'follow 
 
 let pollRunning   = false;
 let _pollCycleCount = 0; // increments each poll run, used for SCHEDULED throttling
-const MAX_UPDATES_PER_AGENT = 100; // max rows to fetch per agent per poll cycle
 let lastPollTime  = null;
 let lastPollStats = {};
 let jobStats      = {};
+
+// ─── Adaptive poll budget ─────────────────────────────────────────────────────
+//
+// Each poll cycle the system scans every agent's Master Tracker (Sheets reads
+// only — zero Hunar API calls) and categorises every row into one of two work
+// buckets:
+//
+//   pollNeeded      — live calls that need a status check:
+//                     INITIATED / IN_PROGRESS / SCHEDULED / NOT_STARTED
+//
+//   backfillNeeded  — calls that finished (COMPLETED) but are still missing
+//                     result/evaluation data in the out.* columns
+//
+// The two budgets are then allocated proportionally across all agents.
+// An agent with ZERO in both buckets is skipped entirely — no API call, no
+// sleep delay.  The moment someone triggers a campaign the agent reappears
+// in the next cycle's scan with a real pendingCount and gets a proper cap.
+//
+// ── Tuning knobs (only these need changing) ───────────────────────────────────
+
+const POLL_BUDGET = {
+  // ── Live-poll budget (INITIATED / IN_PROGRESS / SCHEDULED / NOT_STARTED) ──
+  POLL_GLOBAL:     400,   // total Hunar API slots for live polling across all agents/cycle
+  POLL_MAX_CAP:    300,   // hard ceiling per single agent for live polling
+
+  // ── Backfill budget (COMPLETED rows missing result data) ──────────────────
+  BACKFILL_GLOBAL:  200,  // total Hunar API slots for backfill across all agents/cycle
+  BACKFILL_MAX_CAP: 150,  // hard ceiling per single agent for backfill
+
+  // ── Shared ────────────────────────────────────────────────────────────────
+  // No MIN_CAP — zero means zero.  Agents only get a slot if they have work.
+};
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+/**
+ * Pure proportional allocation — no MIN_CAP, no rounding up.
+ * Returns Map<agentCode, cap> where sum(caps) <= globalBudget.
+ * Agents with count === 0 are omitted from the map entirely.
+ *
+ * @param {{ agentCode: string, count: number }[]} list
+ * @param {number} globalBudget
+ * @param {number} maxCap
+ */
+function _allocateBudget(list, globalBudget, maxCap) {
+  const active = list.filter(a => a.count > 0);
+  if (!active.length) return new Map();
+
+  const total = active.reduce((s, a) => s + a.count, 0);
+  const caps  = new Map();
+  let allocated = 0;
+
+  active.forEach(a => {
+    const raw = Math.ceil((a.count / total) * globalBudget);
+    const cap = Math.min(maxCap, raw);
+    if (cap > 0) { caps.set(a.agentCode, cap); allocated += cap; }
+  });
+
+  // Rare: rounding pushed us over budget — trim fattest first
+  if (allocated > globalBudget) {
+    let overflow = allocated - globalBudget;
+    const sorted = [...caps.entries()].sort((a, b) => b[1] - a[1]);
+    for (const [code, cur] of sorted) {
+      if (overflow <= 0) break;
+      const cut = Math.min(cur, overflow);
+      const newCap = cur - cut;
+      if (newCap > 0) caps.set(code, newCap); else caps.delete(code);
+      overflow -= cut;
+    }
+  }
+
+  return caps;
+}
+
+/**
+ * Scan an agent's Master Tracker (Sheets-only, no Hunar calls) and return
+ * how many rows fall into each work bucket.
+ *
+ * @returns {{ pollNeeded: number, backfillNeeded: number }}
+ */
+async function _scanAgentWork(agent) {
+  const result = { pollNeeded: 0, backfillNeeded: 0 };
+  try {
+    const ssId   = agent.spreadsheetId || MAIN_SS_ID;
+    const mtName = agent.spreadsheetId ? AGT.MASTER_TRACKER : (agent.agentCode + AGT.MASTER_TRACKER);
+    const { headers, rows } = await readSheet(ssId, mtName);
+    if (!headers.length || !rows.length) return result;
+
+    const statusCol   = headers.indexOf('Status');
+    if (statusCol < 0) return result;
+
+    const LIVE_STATUSES = new Set(['INITIATED', 'IN_PROGRESS', 'SCHEDULED', 'NOT_STARTED']);
+    const resultFields  = resultFieldNames(agent.resultSchema);
+
+    for (const row of rows) {
+      const status = String(row[statusCol] || '').toUpperCase();
+
+      // Terminal — Hunar will never update these again
+      if (status === 'NOT_CONNECTED' || status === 'FAILED' || status === 'CANCELLED') continue;
+
+      if (LIVE_STATUSES.has(status)) {
+        result.pollNeeded++;
+        continue;
+      }
+
+      if (status === 'COMPLETED') {
+        const hasResult = resultFields.length === 0 || resultFields.some(f => {
+          const col = headers.indexOf('out.' + f);
+          return col >= 0 && String(row[col] || '').trim() !== '';
+        });
+        if (!hasResult) result.backfillNeeded++;
+        // COMPLETED + has results → fully done, skip
+      }
+    }
+  } catch { /* sheet unreadable — treat as idle */ }
+  return result;
+}
+
+/**
+ * Compute per-agent { pollCap, backfillCap } from scan results.
+ * Returns Map<agentCode, { pollCap, backfillCap }>.
+ * Agents with both counts === 0 are absent from the map (→ skip entirely).
+ */
+function computeAgentCaps(scanResults) {
+  const { POLL_GLOBAL, POLL_MAX_CAP, BACKFILL_GLOBAL, BACKFILL_MAX_CAP } = POLL_BUDGET;
+
+  const pollCaps     = _allocateBudget(scanResults.map(r => ({ agentCode: r.agentCode, count: r.pollNeeded     })), POLL_GLOBAL,     POLL_MAX_CAP);
+  const backfillCaps = _allocateBudget(scanResults.map(r => ({ agentCode: r.agentCode, count: r.backfillNeeded })), BACKFILL_GLOBAL, BACKFILL_MAX_CAP);
+
+  const combined = new Map();
+  for (const { agentCode } of scanResults) {
+    const pollCap     = pollCaps.get(agentCode)     || 0;
+    const backfillCap = backfillCaps.get(agentCode) || 0;
+    if (pollCap > 0 || backfillCap > 0) {
+      combined.set(agentCode, { pollCap, backfillCap });
+    }
+  }
+  return combined;
+}
 
 // ─── Hunar API helpers ────────────────────────────────────────────────────────
 
@@ -347,12 +485,53 @@ async function pollActiveBatches(agentCodeFilter = null) {
 
     const targets = agentCodeFilter ? agents.filter(a => a.agentCode === agentCodeFilter) : agents;
 
+    // ── Adaptive cap calculation ─────────────────────────────────────────────
+    // Scan every agent's Master Tracker in parallel (Sheets reads only, zero
+    // Hunar API cost) to count:
+    //   pollNeeded     — live calls (INITIATED / IN_PROGRESS / SCHEDULED / NOT_STARTED)
+    //   backfillNeeded — COMPLETED calls still missing result data
+    //
+    // Budget is then allocated proportionally across agents.
+    // Agents with 0 in both buckets are skipped entirely this cycle.
+    // The moment a campaign is triggered the agent appears in the next scan.
+    let agentCaps;
+    let scanSummary = [];
+
+    if (agentCodeFilter) {
+      // Forced single-agent poll: use the full budget caps for both buckets
+      agentCaps = new Map([[agentCodeFilter, {
+        pollCap:     POLL_BUDGET.POLL_MAX_CAP,
+        backfillCap: POLL_BUDGET.BACKFILL_MAX_CAP,
+      }]]);
+    } else {
+      console.log(`[poll] Scanning work queues across ${targets.length} agents…`);
+      const scanResults = await Promise.all(
+        targets.map(a => _scanAgentWork(a).then(r => ({ agentCode: a.agentCode, ...r })))
+      );
+      agentCaps = computeAgentCaps(scanResults);
+
+      // Build log summary
+      scanSummary = scanResults.map(r => {
+        const caps = agentCaps.get(r.agentCode);
+        if (!caps) return `${r.agentCode}: IDLE`;
+        return `${r.agentCode}: poll=${r.pollNeeded}→${caps.pollCap} backfill=${r.backfillNeeded}→${caps.backfillCap}`;
+      });
+      console.log('[poll] Budget allocation:');
+      scanSummary.forEach(s => console.log('  ' + s));
+    }
+    // ── End adaptive cap ─────────────────────────────────────────────────────
+
     for (const agent of targets) {
+      const caps = agentCaps.get(agent.agentCode);
+      if (!caps) {
+        // Truly idle — no pending poll or backfill work
+        continue;
+      }
       try {
-        const stats = await _pollAgent(agent, userRoleMap, triggerMap);
-        lastPollStats[agent.agentCode] = stats;
-        console.log(`[poll] ${agent.agentCode}: fetched=${stats.fetched} updated=${stats.updated} errors=${stats.errors} ql=${stats.qlAdded}`);
-        // Brief pause between agents to spread quota usage (quota = 60 writes/min)
+        const stats = await _pollAgent(agent, userRoleMap, triggerMap, caps.pollCap, caps.backfillCap);
+        lastPollStats[agent.agentCode] = { ...stats, pollCap: caps.pollCap, backfillCap: caps.backfillCap };
+        console.log(`[poll] ${agent.agentCode}: pollCap=${caps.pollCap} backfillCap=${caps.backfillCap} fetched=${stats.fetched} updated=${stats.updated} errors=${stats.errors} ql=${stats.qlAdded}`);
+        // Brief pause between agents to spread quota usage
         await sleep(1200);
       } catch (err) {
         console.error(`[poll] Error on ${agent.agentCode}:`, err.message);
@@ -366,7 +545,7 @@ async function pollActiveBatches(agentCodeFilter = null) {
   }
 }
 
-async function _pollAgent(agent, userRoleMap, triggerMap) {
+async function _pollAgent(agent, userRoleMap, triggerMap, pollCap = POLL_BUDGET.POLL_MAX_CAP, backfillCap = POLL_BUDGET.BACKFILL_MAX_CAP) {
   const stats = { fetched: 0, updated: 0, errors: 0, qlAdded: 0 };
   // Use per-agent spreadsheet (agent.spreadsheetId). Fall back to MAIN_SS_ID with prefix for legacy.
   const agentSsId = agent.spreadsheetId || MAIN_SS_ID;
@@ -436,7 +615,7 @@ async function _pollAgent(agent, userRoleMap, triggerMap) {
   //
   // SCHEDULED/NOT_STARTED throttle: previous-day rows only (every 10th cycle).
   //   Today's SCHEDULED/NOT_STARTED are always included so fresh campaigns aren't delayed.
-  // Cap at MAX_UPDATES_PER_AGENT to stay within Sheets quota.
+  // Cap at pollCap / backfillCap (adaptive — computed per cycle via _scanAgentWork).
 
   const rowPriority = (status, hasResult) => {
     if (status === 'COMPLETED' && !hasResult) return 0; // urgent — get eval data
@@ -500,26 +679,32 @@ async function _pollAgent(agent, userRoleMap, triggerMap) {
   });
 
   // ── Two-pass split ────────────────────────────────────────────────────────
-  // Pass 1 — URGENT (uncapped): COMPLETED rows with eval/result still missing.
-  //   These are fetched NO MATTER WHAT — no row cap, no sequence dependency.
-  //   A call that just finished must get its result data this cycle, not next.
+  // Pass 1 — BACKFILL (capped at backfillCap): COMPLETED rows missing eval data.
+  //   Previously uncapped; now uses its own budget bucket from the scan.
+  //   backfillCap is computed proportionally from BACKFILL_GLOBAL across agents.
   //
-  // Pass 2 — NORMAL (capped at MAX_UPDATES_PER_AGENT): everything else.
-  //   Today-first, newest-campaign-first, status priority, row index.
+  // Pass 2 — POLL (capped at pollCap): live calls (IN_PROGRESS / INITIATED /
+  //   SCHEDULED / NOT_STARTED).
+  //   pollCap is computed proportionally from POLL_GLOBAL across agents.
+  //
+  // Both caps were derived from _scanAgentWork() before any Hunar calls were
+  // made, so allocation reflects actual pending work — not assumptions.
 
-  const urgentPass  = candidates.filter(c => c.priority === 0); // COMPLETED, no eval
-  const normalCandidates = candidates.filter(c => c.priority !== 0);
-  const normalPass  = normalCandidates.slice(0, MAX_UPDATES_PER_AGENT);
+  const backfillCandidates = candidates.filter(c => c.priority === 0); // COMPLETED, no eval
+  const pollCandidates     = candidates.filter(c => c.priority !== 0); // live calls
 
-  if (urgentPass.length > 0) {
-    console.log(`[poll] ${agent.agentCode}: ${urgentPass.length} COMPLETED+eval-missing — fetching ALL (uncapped)`);
+  const backfillPass = backfillCandidates.slice(0, backfillCap);
+  const pollPass     = pollCandidates.slice(0, pollCap);
+
+  if (backfillCandidates.length > 0) {
+    console.log(`[poll] ${agent.agentCode}: backfill=${backfillCandidates.length} cap=${backfillCap} → processing ${backfillPass.length}`);
   }
-  if (normalPass.length < normalCandidates.length) {
-    const todayCount = normalCandidates.filter(c => c.isToday).length;
-    console.log(`[poll] ${agent.agentCode}: ${normalCandidates.length} normal pending (${todayCount} today), processing top ${MAX_UPDATES_PER_AGENT}`);
+  if (pollCandidates.length > 0) {
+    const todayCount = pollCandidates.filter(c => c.isToday).length;
+    console.log(`[poll] ${agent.agentCode}: poll=${pollCandidates.length} (${todayCount} today) cap=${pollCap} → processing ${pollPass.length}`);
   }
 
-  const toProcess = [...urgentPass, ...normalPass];
+  const toProcess = [...backfillPass, ...pollPass];
   let updateCount = 0;
 
   for (const { i, row, callId, status, reqId, campaignDone } of toProcess) {
@@ -1609,8 +1794,9 @@ function getStatus() {
   return {
     pollRunning,
     lastPollTime,
-    lastPollStats,
+    lastPollStats,  // per-agent: { fetched, updated, errors, qlAdded, pollCap, backfillCap }
     jobStats,
+    pollBudget: POLL_BUDGET,  // current budget config — tune POLL_GLOBAL / BACKFILL_GLOBAL etc.
     uptime: Math.round(process.uptime()),
     timestamp: new Date().toISOString(),
   };
