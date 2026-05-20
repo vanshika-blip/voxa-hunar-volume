@@ -887,11 +887,24 @@ if (pollPass.length > 0) {
     }
   }
 
-  // Fetch transitioned calls individually (capped at 20)
-  for (const item of transitioned.slice(0, 20)) {
-    const res = await processOne(item);
-    if (res) { rowUpdates.push(res); stats.updated++; }
-    await sleep(150);
+  // Fetch ALL transitioned calls concurrently in chunks — no cap.
+  // Sort: COMPLETED (most likely to have eval data) first, then IN_PROGRESS → RINGING → INITIATED → rest.
+  // This clears the entire backlog in one cycle instead of drip-feeding 20 per cycle.
+  if (transitioned.length > 0) {
+    const ORDER = { 'IN_PROGRESS': 0, 'RINGING': 1, 'INITIATED': 2, 'NOT_STARTED': 3, 'SCHEDULED': 4 };
+    transitioned.sort((a, b) => (ORDER[a.status] ?? 9) - (ORDER[b.status] ?? 9));
+
+    console.log(`[poll] ${agent.agentCode}: ${transitioned.length} transitioned calls — fetching ALL concurrently in chunks`);
+    const TRANS_CONCURRENCY = 8; // 8 parallel Hunar API calls per chunk
+    for (let ci = 0; ci < transitioned.length; ci += TRANS_CONCURRENCY) {
+      const chunk   = transitioned.slice(ci, ci + TRANS_CONCURRENCY);
+      const results = await Promise.allSettled(chunk.map(item => processOne(item)));
+      for (const res of results) {
+        if (res.status === 'fulfilled' && res.value) { rowUpdates.push(res.value); stats.updated++; }
+      }
+      // Small gap between chunks to avoid Hunar rate limits, but not between individual calls
+      if (ci + TRANS_CONCURRENCY < transitioned.length) await sleep(200);
+    }
   }
 }
 
