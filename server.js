@@ -35,6 +35,7 @@ const {
   processCallbackQueue, processRetryQueue,
   getArchivedLeads, getArchivedMT, getArchivedManual,
   getStatus,
+  scheduleAgentPoll,  // ← NEW
 } = require('./poller');
 
 const app  = express();
@@ -1088,6 +1089,12 @@ async function handleUploadContacts(actor, body) {
   const actorFull = users.find(u => u.email === actor.email);
   await appendRows(MAIN_SS_ID, S.TLOG, [[now.toISOString(), actor.email, actorFull?.name || '', actor.team || '', agentCode, reqId, rows.length, estMin]]);
   audit(actor.email, 'trigger_campaign', `${agentCode}:${reqId}`, String(rows.length)).catch(() => {});
+
+  // Schedule a dedicated poll for this agent 10 min from now.
+  // By T+10 most calls have left the INITIATED state, so one targeted sweep
+  // captures the whole batch result without waiting for 2–3 general cycles.
+  scheduleAgentPoll(agentCode, 10 * 60 * 1000);
+
   return { ok: true, agentCode, requestId: reqId, contactsSubmitted: rows.length, contactsAccepted: calls.length, estimatedMinutes: Math.round(estMin * 100) / 100 };
 }
 
@@ -1372,6 +1379,60 @@ async function handleGetCampaigns(actor, body) {
 }
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
+const METRICS_SHEET      = '_Metrics';
+const DAILY_STATS_SHEET  = '_DailyStats';
+const METRICS_STALE_MS   = 15 * 60 * 1000; // treat metrics as stale after 15 min
+
+/**
+ * Try to read pre-computed _Metrics and _DailyStats for an agent.
+ * Returns null if the sheets don't exist or are too stale to trust.
+ */
+async function _readAgentMetrics(ssId, sinceDate) {
+  try {
+    const { headers: mh, rows: mr } = await readSheet(ssId, METRICS_SHEET);
+    if (!mh.length || !mr.length) return null;
+
+    // Check freshness via the Last Updated column
+    const luCol = mh.indexOf('Last Updated');
+    if (luCol >= 0) {
+      const freshest = mr.reduce((best, r) => {
+        const t = new Date(r[luCol] || 0).getTime();
+        return t > best ? t : best;
+      }, 0);
+      if (Date.now() - freshest > METRICS_STALE_MS) return null; // too stale
+    }
+
+    // Index _Metrics columns
+    const mi = h => mh.indexOf(h);
+    const campaigns = mr.map(r => ({
+      requestId:   String(r[mi('Request ID')]    || ''),
+      triggeredBy: String(r[mi('Triggered By')]  || '').toLowerCase(),
+      triggeredAt: String(r[mi('Triggered At')]  || ''),
+      status:      String(r[mi('Status')]        || ''),
+      total:       Number(r[mi('Total')]         || 0),
+      completed:   Number(r[mi('Completed')]     || 0),
+      nc:          Number(r[mi('Not Connected')] || 0),
+      failed:      Number(r[mi('Failed')]        || 0),
+      qualified:   Number(r[mi('Qualified')]     || 0),
+      minutes:     Number(r[mi('Minutes')]       || 0),
+    }));
+
+    // Read _DailyStats
+    const { headers: dh, rows: dr } = await readSheet(ssId, DAILY_STATS_SHEET);
+    const di  = h => dh.indexOf(h);
+    const daily = dh.length ? dr.map(r => ({
+      date:      String(r[di('Date')]      || ''),
+      calls:     Number(r[di('Calls')]     || 0),
+      minutes:   Number(r[di('Minutes')]   || 0),
+      qualified: Number(r[di('Qualified')] || 0),
+    })).filter(d => d.date && new Date(d.date) >= sinceDate) : [];
+
+    return { campaigns, daily };
+  } catch (_) {
+    return null; // silently fall back to full scan
+  }
+}
+
 async function handleGetDashboard(actor, body) {
   const range  = body.range || '7d';
   const days   = range === 'today' ? 0 : range === '30d' ? 30 : 7;
@@ -1380,7 +1441,11 @@ async function handleGetDashboard(actor, body) {
   const vis    = agentsVisibleTo(actor, agents, users);
   const visEmails = new Set(visibleUserEmails(actor, users).map(e => e.toLowerCase()));
 
-  // Build trigger set
+  const sinceDate = range === 'today'
+    ? new Date(new Date().toLocaleDateString('en-CA', { timeZone: IST_TZ }) + 'T00:00:00+05:30')
+    : new Date(Date.now() - days * 86400_000);
+
+  // Build trigger set for non-admin RBAC (same as original)
   let trigSet = new Set();
   if (actor.role !== 'super_admin') {
     try {
@@ -1397,13 +1462,58 @@ async function handleGetDashboard(actor, body) {
   const agentFilter = String(body.agentCode || '');
   const targets = agentFilter ? vis.filter(a => a.agentCode === agentFilter) : vis;
 
-  const sinceDate = range === 'today'
-    ? new Date(new Date().toLocaleDateString('en-CA', { timeZone: IST_TZ }) + 'T00:00:00+05:30')
-    : new Date(Date.now() - days * 86400_000);
-
   for (const a of targets) {
     if (!a.spreadsheetId) continue;
     try {
+      // ── FAST PATH: read pre-computed _Metrics / _DailyStats ─────────────
+      const cached = await _readAgentMetrics(a.spreadsheetId, sinceDate);
+
+      if (cached) {
+        // Use pre-computed data — no full MT/QL scan needed
+        for (const c of cached.campaigns) {
+          // RBAC: non-admins only see campaigns they or their team triggered
+          if (actor.role !== 'super_admin' && !trigSet.has(`${a.agentCode}|${c.requestId}`)) continue;
+
+          // Filter by date range: triggeredAt must be within the range
+          if (c.triggeredAt) {
+            const tAt = new Date(c.triggeredAt);
+            if (!isNaN(tAt.getTime()) && tAt < sinceDate) continue;
+          }
+
+          totalCalls += c.completed + c.nc + c.failed;
+          totalMins  += c.minutes;
+          qualCount  += c.qualified;
+        }
+
+        // Daily chart from _DailyStats
+        for (const d of cached.daily) {
+          byDay[d.date] = byDay[d.date] || { calls: 0, minutes: 0, qualified: 0 };
+          byDay[d.date].calls     += d.calls;
+          byDay[d.date].minutes   += d.minutes;
+          byDay[d.date].qualified += d.qualified;
+        }
+
+        // lineupCount: still needs QL Feedback — lightweight read (only 2 cols needed)
+        try {
+          const { headers: qh, rows: qr } = await readSheet(a.spreadsheetId, AGT.QL);
+          if (qh.length) {
+            const aec = qh.indexOf('Assigned To Email');
+            const fbc = qh.indexOf('Feedback');
+            qr.forEach(r => {
+              const assigned = String(r[aec] || '').toLowerCase();
+              if ((actor.role === 'recruiter' || actor.role === 'individual_contributor') && assigned !== actor.email) return;
+              if (actor.role === 'team_lead' && assigned && !visEmails.has(assigned)) return;
+              const fb = String(r[fbc] || '').toLowerCase();
+              if (_isInterviewLinedUp(fb)) lineupCount++;
+            });
+          }
+        } catch (_) {}
+
+        continue; // done with this agent — skip the full scan below
+      }
+
+      // ── SLOW PATH (fallback): original full MT/QL row scan ───────────────
+      // Used when _Metrics doesn't exist yet or is stale (e.g. first server boot)
       const { headers: mh, rows: mr } = await readSheet(a.spreadsheetId, AGT.MT);
       if (!mh.length) continue;
       const ri = mh.indexOf('Request ID'); const di = mh.indexOf('Duration (Minutes)');
@@ -1449,7 +1559,6 @@ async function handleGetDashboard(actor, body) {
 
   if (MANUAL_TRACKER_SS_ID) {
     try {
-      const users = await getAllUsers();
       const visTeams = actor.role === 'super_admin'
         ? (await getAllTeams()).map(t => t.name)
         : [actor.team].filter(Boolean);
@@ -1465,12 +1574,10 @@ async function handleGetDashboard(actor, body) {
 
           let tTotal = 0, tConn = 0, tLined = 0;
           rows.forEach(r => {
-            // date filter
             if (dti >= 0 && r[dti]) {
               const d = new Date(r[dti]);
               if (!isNaN(d.getTime()) && d < sinceDate) return;
             }
-            // role filter — recruiter sees only their own
             if ((actor.role === 'recruiter' || actor.role === 'individual_contributor') && aei >= 0) {
               if (String(r[aei] || '').toLowerCase() !== actor.email) return;
             }
@@ -1527,23 +1634,16 @@ async function handleGetDashboard(actor, body) {
   return {
     ok: true, range,
     stats: {
-      // AI call stats
       totalCalls, totalMinutes: Math.round(totalMins * 100) / 100,
       qualifiedLeads: qualCount, lineupCount,
       conversionRate: qualCount > 0 ? Math.round(lineupCount / qualCount * 1000) / 10 : 0,
-      // Manual tracker stats
       manual: {
         total: manualTotal,
         connected: manualConnected,
         linedUp: manualLinedUp,
         byTeam: manualByTeam,
       },
-      // Interview lineup stats
-      lineup: {
-        total: lineupTotal,
-        byTeam: lineupByTeam,
-      },
-      // Combined
+      lineup: { total: lineupTotal, byTeam: lineupByTeam },
       combined: {
         totalLeads:   qualCount + manualTotal,
         totalLinedUp: lineupCount + manualLinedUp,
