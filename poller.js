@@ -2,7 +2,8 @@
  * poller.js — All background jobs for Voxa Portal
  * 
  * Jobs:
- *   - pollActiveBatches      every 2 min
+ *   - pollActiveBatches      every 2 min  (concurrent fetches, 0-completed campaigns first)
+ *   - autoQualifyLeads       every 10 min (DB-driven rules, no restart needed)
  *   - backfillMissingOutputs every 15 min (staggered)
  *   - repairUnassignedLeads  every 20 min
  *   - cleanupExpiredSessions every hour
@@ -166,7 +167,8 @@ async function _scanAgentWork(agent) {
     const { headers, rows } = await readSheet(ssId, mtName);
     if (!headers.length || !rows.length) return result;
 
-    const statusCol   = headers.indexOf('Status');
+    const statusCol    = headers.indexOf('Status');
+    const reqIdColIdx  = headers.indexOf('Request ID');
     if (statusCol < 0) return result;
 
     const LIVE_STATUSES = new Set(['INITIATED', 'IN_PROGRESS', 'SCHEDULED', 'NOT_STARTED']);
@@ -192,59 +194,49 @@ async function _scanAgentWork(agent) {
         // COMPLETED + has results → fully done, skip
       }
     }
+
+    // Also build the completedPerCampaign map for the sort inside _pollAgent
+    // (cheaper to compute here once rather than inside _pollAgent again)
+    result.completedPerCampaign = new Map();
+    for (const row2 of rows) {
+      const s2 = String(row2[statusCol] || '').toUpperCase();
+      const ri  = reqIdColIdx >= 0 ? String(row2[reqIdColIdx] || '') : '';
+      if (s2 === 'COMPLETED' && ri) {
+        result.completedPerCampaign.set(ri, (result.completedPerCampaign.get(ri) || 0) + 1);
+      }
+    }
+
   } catch { /* sheet unreadable — treat as idle */ }
   return result;
 }
 
 /**
- * Compute per-agent { pollCap, backfillCap } from scan results.
+ * Compute per-agent { pollCap, backfillCap } purely from live scan counts.
+ * No database columns, no overrides — cap is 100% self-calculated every cycle.
  *
- * Resolution order per agent:
- *   1. agent.skipPolling = TRUE  → omit from map entirely (skipped this cycle)
- *   2. agent.pollCapOverride set → use that number directly (ignore auto-calc)
- *   3. agent.backfillCapOverride → same for backfill
- *   4. neither override set      → proportional auto-calc from scan counts
+ * Each agent's share = proportional to its pending work out of the global budget.
+ * Agents with zero work in both buckets are absent from the map → skipped.
  *
- * scanResults: Array of { agentCode, pollNeeded, backfillNeeded, agent }
- * Returns Map<agentCode, { pollCap, backfillCap, source: 'override'|'auto'|'mixed' }>
+ * Returns Map<agentCode, { pollCap, backfillCap }>
  */
 function computeAgentCaps(scanResults) {
   const { POLL_GLOBAL, POLL_MAX_CAP, BACKFILL_GLOBAL, BACKFILL_MAX_CAP } = POLL_BUDGET;
 
-  // Separate agents into those needing auto-calc vs those with full overrides
-  const needsAutoPoll     = scanResults.filter(r => r.pollCapOverride     === null && !r.skipPolling);
-  const needsAutoBackfill = scanResults.filter(r => r.backfillCapOverride === null && !r.skipPolling);
-
-  // Auto-calc only for agents that need it
-  const autoPollCaps     = _allocateBudget(
-    needsAutoPoll.map(r => ({ agentCode: r.agentCode, count: r.pollNeeded })),
+  const pollCaps     = _allocateBudget(
+    scanResults.map(r => ({ agentCode: r.agentCode, count: r.pollNeeded })),
     POLL_GLOBAL, POLL_MAX_CAP
   );
-  const autoBackfillCaps = _allocateBudget(
-    needsAutoBackfill.map(r => ({ agentCode: r.agentCode, count: r.backfillNeeded })),
+  const backfillCaps = _allocateBudget(
+    scanResults.map(r => ({ agentCode: r.agentCode, count: r.backfillNeeded })),
     BACKFILL_GLOBAL, BACKFILL_MAX_CAP
   );
 
   const combined = new Map();
-
   for (const r of scanResults) {
-    // Skip polling entirely if flagged in the sheet
-    if (r.skipPolling) continue;
-
-    const pollCap = r.pollCapOverride !== null
-      ? r.pollCapOverride                        // manual override from Agents sheet
-      : (autoPollCaps.get(r.agentCode) || 0);   // auto-calc
-
-    const backfillCap = r.backfillCapOverride !== null
-      ? r.backfillCapOverride
-      : (autoBackfillCaps.get(r.agentCode) || 0);
-
-    // Only include agents that have actual work to do
+    const pollCap     = pollCaps.get(r.agentCode)     || 0;
+    const backfillCap = backfillCaps.get(r.agentCode) || 0;
     if (pollCap > 0 || backfillCap > 0) {
-      const source = (r.pollCapOverride !== null && r.backfillCapOverride !== null) ? 'override'
-                   : (r.pollCapOverride !== null || r.backfillCapOverride !== null) ? 'mixed'
-                   : 'auto';
-      combined.set(r.agentCode, { pollCap, backfillCap, source });
+      combined.set(r.agentCode, { pollCap, backfillCap });
     }
   }
   return combined;
@@ -332,18 +324,6 @@ async function getAllAgents(force = false) {
       if (typeof raw === 'string' && raw.trim().startsWith('[')) qualRules = JSON.parse(raw);
     } catch (_) {}
 
-    // ── Poll config columns (optional — leave blank for auto) ──────────────
-    // Poll Cap      → manual override for live-call cap this agent gets per cycle
-    // Backfill Cap  → manual override for backfill cap
-    // Skip Polling  → TRUE to pause polling entirely for this agent
-    const rawPollCap     = r[idx('Poll Cap')];
-    const rawBackfillCap = r[idx('Backfill Cap')];
-    const rawSkip        = r[idx('Skip Polling')];
-
-    const pollCapOverride     = rawPollCap     && !isNaN(Number(rawPollCap))     ? Number(rawPollCap)     : null;
-    const backfillCapOverride = rawBackfillCap && !isNaN(Number(rawBackfillCap)) ? Number(rawBackfillCap) : null;
-    const skipPolling         = rawSkip === true || String(rawSkip || '').toUpperCase() === 'TRUE';
-
     return {
       agentCode:          String(r[idx('Agent Code')] || '').trim(),
       agentId:            String(r[idx('Agent ID')] || '').trim(),
@@ -358,10 +338,6 @@ async function getAllAgents(force = false) {
       createdBy:          String(r[idx('Created By')] || '').trim(),
       clientName:         String(r[idx('Client Name')] || '').trim(),
       spreadsheetId:      String(r[idx('Spreadsheet ID')] || '').trim(),
-      // Poll control (read from Agents sheet)
-      pollCapOverride,      // number | null  — null = let auto-calc decide
-      backfillCapOverride,  // number | null
-      skipPolling,          // boolean        — true = skip entirely this cycle
     };
   }).filter(a => a.agentCode);
 
@@ -555,27 +531,20 @@ async function pollActiveBatches(agentCodeFilter = null) {
       console.log(`[poll] Scanning work queues across ${targets.length} agents…`);
       const scanResults = await Promise.all(
         targets.map(a => _scanAgentWork(a).then(r => ({
-          agentCode:         a.agentCode,
-          pollNeeded:        r.pollNeeded,
-          backfillNeeded:    r.backfillNeeded,
-          // Pass the per-agent overrides read from the Agents sheet
-          pollCapOverride:     a.pollCapOverride,     // number | null
-          backfillCapOverride: a.backfillCapOverride, // number | null
-          skipPolling:         a.skipPolling,         // boolean
+          agentCode:      a.agentCode,
+          pollNeeded:     r.pollNeeded,
+          backfillNeeded: r.backfillNeeded,
         })))
       );
       agentCaps = computeAgentCaps(scanResults);
 
-      // Build log summary — show source so it's obvious what's auto vs overridden
+      // Log: show each agent's scan count → calculated cap
       scanSummary = scanResults.map(r => {
-        if (r.skipPolling) return `${r.agentCode}: SKIP (Skip Polling=TRUE in sheet)`;
         const caps = agentCaps.get(r.agentCode);
-        if (!caps) return `${r.agentCode}: IDLE (poll=${r.pollNeeded} backfill=${r.backfillNeeded})`;
-        const pollLabel     = r.pollCapOverride     !== null ? `${caps.pollCap}[override]`     : `${r.pollNeeded}→${caps.pollCap}[auto]`;
-        const backfillLabel = r.backfillCapOverride !== null ? `${caps.backfillCap}[override]` : `${r.backfillNeeded}→${caps.backfillCap}[auto]`;
-        return `${r.agentCode}: poll=${pollLabel}  backfill=${backfillLabel}`;
+        if (!caps) return `${r.agentCode}: IDLE`;
+        return `${r.agentCode}: poll=${r.pollNeeded}→${caps.pollCap}  backfill=${r.backfillNeeded}→${caps.backfillCap}`;
       });
-      console.log('[poll] Budget allocation:');
+      console.log('[poll] Budget allocation (auto-calc from live scan):');
       scanSummary.forEach(s => console.log('  ' + s));
     }
     // ── End adaptive cap ─────────────────────────────────────────────────────
@@ -589,7 +558,7 @@ async function pollActiveBatches(agentCodeFilter = null) {
       try {
         const stats = await _pollAgent(agent, userRoleMap, triggerMap, caps.pollCap, caps.backfillCap);
         lastPollStats[agent.agentCode] = { ...stats, pollCap: caps.pollCap, backfillCap: caps.backfillCap };
-        console.log(`[poll] ${agent.agentCode}: pollCap=${caps.pollCap}(${caps.source}) backfillCap=${caps.backfillCap}(${caps.source}) fetched=${stats.fetched} updated=${stats.updated} errors=${stats.errors} ql=${stats.qlAdded}`);
+        console.log(`[poll] ${agent.agentCode}: pollCap=${caps.pollCap} backfillCap=${caps.backfillCap} fetched=${stats.fetched} updated=${stats.updated} errors=${stats.errors}`);
         // Brief pause between agents to spread quota usage
         await sleep(1200);
       } catch (err) {
@@ -598,18 +567,8 @@ async function pollActiveBatches(agentCodeFilter = null) {
     }
     lastPollTime = new Date();
 
-    // ── QL sync: run after all MT writes are flushed ─────────────────────────
-    // Now that every agent's Master Tracker is up to date, scan for newly
-    // qualified COMPLETED rows and batch-append them to Qualified Leads.
-    // This is much faster than doing it inside the poll loop because:
-    //   • No per-call QL reads — one read per agent total
-    //   • All new QL rows land in ONE appendRows call per agent
-    //   • Poll loop stays lean: only Hunar GET + MT write per call
-    const activeAgents = (agentCodeFilter
-      ? targets
-      : targets.filter(a => agentCaps.has(a.agentCode))
-    );
-    await syncQualifiedLeads(activeAgents, userRoleMap, triggerMap);
+    // QL sync is handled entirely by the autoQualifyLeads cron (every 10 min).
+    // pollActiveBatches only writes Master Tracker rows — nothing else.
 
   } finally {
     pollRunning = false;
@@ -619,11 +578,11 @@ async function pollActiveBatches(agentCodeFilter = null) {
 }
 
 async function _pollAgent(agent, userRoleMap, triggerMap, pollCap = POLL_BUDGET.POLL_MAX_CAP, backfillCap = POLL_BUDGET.BACKFILL_MAX_CAP) {
-  const stats = { fetched: 0, updated: 0, errors: 0, qlAdded: 0 };
-  // Use per-agent spreadsheet (agent.spreadsheetId). Fall back to MAIN_SS_ID with prefix for legacy.
+  // poll does ONE thing: fetch Hunar status → write Master Tracker row.
+  // Qualified Leads sync is fully handled by autoQualifyLeads cron (every 10 min).
+  const stats = { fetched: 0, updated: 0, errors: 0 };
   const agentSsId = agent.spreadsheetId || MAIN_SS_ID;
   const mtName = agent.spreadsheetId ? AGT.MASTER_TRACKER : (agent.agentCode + AGT.MASTER_TRACKER);
-  const qlName = agent.spreadsheetId ? AGT.QUALIFIED_LEADS : (agent.agentCode + AGT.QUALIFIED_LEADS);
   const ncName = agent.spreadsheetId ? AGT.NOT_CONNECTED   : (agent.agentCode + AGT.NOT_CONNECTED);
 
   const { headers: mtHeaders, rows: mtRows } = await readSheet(agentSsId, mtName);
@@ -636,8 +595,6 @@ async function _pollAgent(agent, userRoleMap, triggerMap, pollCap = POLL_BUDGET.
 
   const resultFields = resultFieldNames(agent.resultSchema);
   const customVars   = agent.customVariables || [];
-
-  // QL sync is done by syncQualifiedLeads() after MT writes — not here.
 
   // Load NC existing IDs
   const { rows: ncRows } = await readSheet(agentSsId, ncName);
@@ -735,16 +692,34 @@ async function _pollAgent(agent, userRoleMap, triggerMap, pollCap = POLL_BUDGET.
     candidates.push({ i, row, callId, status, reqId, priority, campaignDone, isToday, triggeredAtMs });
   }
 
+  // ── Count COMPLETED calls per campaign — drives the "0-completed first" sort ─
+  // Campaigns where the AI hasn't finished a single call yet are most urgent:
+  // their data is completely unknown. We serve those first, then campaigns with
+  // some completions, then campaigns that are nearly done.
+  // Within the same completion tier we fall back to the existing priority order.
+  const completedPerCampaign = new Map(); // reqId → number of COMPLETED rows in MT
+  for (const row of mtRows) {
+    const status = String(row[statusCol] || '').toUpperCase();
+    const rid    = reqIdCol >= 0 ? String(row[reqIdCol] || '') : '';
+    if (status === 'COMPLETED' && rid) {
+      completedPerCampaign.set(rid, (completedPerCampaign.get(rid) || 0) + 1);
+    }
+  }
+
   // Sort:
-  //   1. Today first (isToday DESC)
-  //   2. Newest campaign first (triggeredAtMs DESC) — "last triggered → polled first"
-  //   3. Status urgency (priority ASC)
-  //   4. Newest row in same campaign (row index DESC)
+  //   1. Campaigns with FEWEST completed calls first (0-completed → top priority)
+  //   2. Today's campaigns before previous days
+  //   3. Newest triggered campaign first (within same completion tier)
+  //   4. Status urgency (IN_PROGRESS > INITIATED > SCHEDULED)
+  //   5. Newest row in same campaign (row index DESC)
   candidates.sort((a, b) => {
-    if (a.isToday !== b.isToday) return a.isToday ? -1 : 1;            // today before prev days
+    const aDone = completedPerCampaign.get(a.reqId) || 0;
+    const bDone = completedPerCampaign.get(b.reqId) || 0;
+    if (aDone !== bDone)                 return aDone - bDone;                         // 0-completed first
+    if (a.isToday !== b.isToday)         return a.isToday ? -1 : 1;                   // today before prev days
     if (a.triggeredAtMs !== b.triggeredAtMs) return b.triggeredAtMs - a.triggeredAtMs; // newest campaign first
-    if (a.priority !== b.priority) return a.priority - b.priority;     // status urgency
-    return b.i - a.i;                                                  // newest row in campaign
+    if (a.priority !== b.priority)       return a.priority - b.priority;              // status urgency
+    return b.i - a.i;                                                                  // newest row
   });
 
   // ── Two-pass split ────────────────────────────────────────────────────────
@@ -774,70 +749,53 @@ async function _pollAgent(agent, userRoleMap, triggerMap, pollCap = POLL_BUDGET.
   }
 
   const toProcess = [...backfillPass, ...pollPass];
-  let updateCount = 0;
 
-  for (const { i, row, callId, status, reqId, campaignDone } of toProcess) {
+  // ── Concurrent fetch — process CONCURRENCY calls at a time ───────────────
+  // Serial: 100 calls × 150ms = 15s per agent.
+  // Concurrent (5): 100 calls / 5 × 150ms = 3s per agent. ~5x faster.
+  // Hunar rate limit is 10 req/s; CONCURRENCY=5 at 150ms gap = ~5 req/s — safe.
+  const CONCURRENCY = 5;
 
-    // Fetch from Hunar
+  async function processOne({ i, row, callId, status, reqId, campaignDone }) {
     stats.fetched++;
     const r = await getCall(callId);
-    if (!r.ok) {
-      stats.errors++;
-      continue;
-    }
+    if (!r.ok) { stats.errors++; return null; }
 
     const d = r.data;
     const newStatus = String(d.status || status).toUpperCase();
-    const result = d.result || {};
+    const result    = d.result || {};
 
-    // Build updated row
     const newRow = [...row];
-    const setH = (name, val) => {
-      const k = mtHeaders.indexOf(name);
-      if (k >= 0) newRow[k] = val;
-    };
+    const setH = (name, val) => { const k = mtHeaders.indexOf(name); if (k >= 0) newRow[k] = val; };
 
     setH('Status',             newStatus);
     setH('Duration (Minutes)', d.duration_minutes ?? (row[mtHeaders.indexOf('Duration (Minutes)')] || 0));
     setH('Duration (Seconds)', d.duration_seconds ?? (row[mtHeaders.indexOf('Duration (Seconds)')] || 0));
     setH('Started At',         d.started_at || row[mtHeaders.indexOf('Started At')] || '');
-    setH('Ended At',           d.ended_at || row[mtHeaders.indexOf('Ended At')] || '');
-    setH('Answered By',        d.answered_by || '');
-    setH('Engagement Status',  d.engagement_status || '');
-    setH('Call Ended By',      d.call_ended_by || '');
-    setH('Recording URL',      d.recording_url || '');
+    setH('Ended At',           d.ended_at   || row[mtHeaders.indexOf('Ended At')]   || '');
+    setH('Answered By',        d.answered_by        || '');
+    setH('Engagement Status',  d.engagement_status  || '');
+    setH('Call Ended By',      d.call_ended_by      || '');
+    setH('Recording URL',      d.recording_url      || '');
     setH('Updated At',         new Date().toISOString());
 
-    customVars.forEach(cv => {
-      const src = d.custom_data?.[cv];
-      if (src !== undefined) setH('in.' + cv, src);
-    });
-    resultFields.forEach(f => {
-      setH('out.' + f, result[f] !== undefined ? result[f] : '');
-    });
+    customVars.forEach(cv => { if (d.custom_data?.[cv] !== undefined) setH('in.' + cv, d.custom_data[cv]); });
+    resultFields.forEach(f => { setH('out.' + f, result[f] !== undefined ? result[f] : ''); });
 
-    rowUpdates.push({ rowIndex: i + 2, values: newRow }); // +2: header row + 1-based
-    stats.updated++;
-    updateCount++;
-
-    // QL sync is handled by syncQualifiedLeads() after MT writes complete.
-    // Keeping QL logic out of the hot poll loop means each iteration is
-    // purely: Hunar GET + build row — no extra Sheets reads/appends inline.
-
-    // NC sheet handling
+    // NC handling (serial-safe: ncExistingIds is a Set, mutations are fine)
     if (newStatus === 'COMPLETED' && ncExistingIds.has(callId)) {
       const ncRowIdx = ncRows.findIndex(r => String(r[0] || '').trim() === callId);
-      if (ncRowIdx >= 0) ncDeletes.push(ncRowIdx + 2); // +2: header + 1-based
+      if (ncRowIdx >= 0) ncDeletes.push(ncRowIdx + 2);
     } else if ((newStatus === 'NOT_CONNECTED' || newStatus === 'FAILED') && campaignDone) {
       if (!ncExistingIds.has(callId) && status !== 'COMPLETED') {
         const calleeNameCol = mtHeaders.indexOf('Callee Name');
-        const mobileCol = mtHeaders.indexOf('Mobile Number');
-        const trigByCol = mtHeaders.indexOf('Triggered By');
-        const retryDate = new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString().slice(0, 10);
+        const mobileCol     = mtHeaders.indexOf('Mobile Number');
+        const trigByCol     = mtHeaders.indexOf('Triggered By');
+        const retryDate     = new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString().slice(0, 10);
         ncAppends.push([
           callId,
           calleeNameCol >= 0 ? String(row[calleeNameCol] || '') : '',
-          mobileCol >= 0 ? String(row[mobileCol] || '') : '',
+          mobileCol     >= 0 ? String(row[mobileCol]     || '') : '',
           newStatus, reqId, 0, 0, '',
           trigByCol >= 0 ? String(row[trigByCol] || '') : '',
           new Date().toISOString(), retryDate, 'PENDING', '',
@@ -846,8 +804,22 @@ async function _pollAgent(agent, userRoleMap, triggerMap, pollCap = POLL_BUDGET.
       }
     }
 
-    // Throttle: 1 Hunar API call per 150ms (safe at ~6 req/sec)
-    await sleep(150);
+    return { rowIndex: i + 2, values: newRow };
+  }
+
+  // Process in chunks of CONCURRENCY — each chunk fires in parallel,
+  // then we wait for all to settle before the next chunk.
+  for (let ci = 0; ci < toProcess.length; ci += CONCURRENCY) {
+    const chunk = toProcess.slice(ci, ci + CONCURRENCY);
+    const results = await Promise.allSettled(chunk.map(item => processOne(item)));
+    for (const res of results) {
+      if (res.status === 'fulfilled' && res.value) {
+        rowUpdates.push(res.value);
+        stats.updated++;
+      }
+    }
+    // Inter-chunk gap: keeps total rate at CONCURRENCY / gap req/s
+    if (ci + CONCURRENCY < toProcess.length) await sleep(150);
   }
 
   // Flush all writes — ONE batchUpdate call instead of N individual writes
@@ -911,7 +883,7 @@ async function _pollAgent(agent, userRoleMap, triggerMap, pollCap = POLL_BUDGET.
       evalUpdates.push({ rowIndex, values: newRow });
       stats.updated++;
 
-      // QL sync handled by syncQualifiedLeads() — not inline here.
+      // QL is synced by autoQualifyLeads cron — nothing to do here.
     }
 
     if (evalUpdates.length) {
@@ -939,41 +911,7 @@ async function _pollAgent(agent, userRoleMap, triggerMap, pollCap = POLL_BUDGET.
   return stats;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// QL SYNC — separated from the poll loop for speed
-//
-// Why it's separate:
-//   The poll loop's one job is "fetch Hunar status → write MT row".
-//   Every extra read/write inside that loop (loading QL IDs, appending rows)
-//   costs time and Sheets quota per call, serialised with the 150ms throttle.
-//
-//   This function runs AFTER all MT writes are flushed.  It reads MT once,
-//   reads QL once, figures out what's missing, and batch-appends everything
-//   in a single API call.  N qualified calls = 1 appendRows call.
-//
-// Called by: pollActiveBatches() after the per-agent poll loop completes.
-// ─────────────────────────────────────────────────────────────────────────────
 
-async function syncQualifiedLeads(agents, userRoleMap, triggerMap) {
-  let totalAdded = 0;
-
-  for (const agent of agents) {
-    try {
-      const added = await _syncAgentQL(agent, userRoleMap, triggerMap);
-      if (added > 0) {
-        console.log(`[ql-sync] ${agent.agentCode}: +${added} new qualified leads`);
-        totalAdded += added;
-      }
-    } catch (err) {
-      console.error(`[ql-sync] Error on ${agent.agentCode}:`, err.message);
-    }
-  }
-
-  if (totalAdded > 0) {
-    console.log(`[ql-sync] Total added this cycle: ${totalAdded}`);
-  }
-  return totalAdded;
-}
 
 async function _syncAgentQL(agent, userRoleMap, triggerMap) {
   const agentSsId = agent.spreadsheetId || MAIN_SS_ID;
@@ -1006,12 +944,18 @@ async function _syncAgentQL(agent, userRoleMap, triggerMap) {
       if (!hasResult) continue;
     }
 
-    // Check qualification
+    // Extract result data from out.* columns
     const result = {};
     resultFields.forEach(f => {
       const col = mtHeaders.indexOf('out.' + f);
       if (col >= 0) result[f] = row[col];
     });
+
+    // ── Qualification check — rules come LIVE from the Agents sheet ──────────
+    // qualificationField / qualificationValues / qualificationRules are read
+    // from the Agents sheet on every cache refresh (5-min TTL).
+    // To change who qualifies: edit the Agents sheet → takes effect next cycle.
+    // No code changes needed.
     if (!isQualified(agent, result)) continue;
 
     const callId = String(row[callIdCol] || '').trim();
@@ -1021,6 +965,21 @@ async function _syncAgentQL(agent, userRoleMap, triggerMap) {
   }
 
   if (!completedQualified.length) return 0;
+
+  // Log the active rule so it's visible in Render logs
+  const ruleDesc = (() => {
+    if (agent.qualificationRules?.length) {
+      return agent.qualificationRules.map(r =>
+        `${r.field} contains [${(r.keywords||[]).join('|')}]`
+      ).join(' AND ');
+    }
+    if (agent.qualificationField) {
+      const vals = agent.qualificationValues || [];
+      return `${agent.qualificationField} ∈ [${vals.join('|') || 'any non-empty'}]`;
+    }
+    return 'no rule — all COMPLETED pass';
+  })();
+  console.log(`[ql-sync] ${agent.agentCode}: rule="${ruleDesc}" → ${completedQualified.length} candidates`);
 
   // Read QL — get existing call IDs to avoid duplicates
   const { headers: qlHeaders, rows: qlRows } = await readSheet(agentSsId, qlName);
@@ -1140,6 +1099,54 @@ async function _refreshCampaignTracker(agent, agentSsId, mtHeaders, mtRows) {
 // ─────────────────────────────────────────────────────────────────────────────
 // JOB 2: BACKFILL MISSING OUTPUTS
 // For COMPLETED rows missing result data, fetch from Hunar and fill in
+// ─────────────────────────────────────────────────────────────────────────────
+// AUTO-QUALIFY — standalone cron, runs every 10 min
+//
+// Scans every active agent's Master Tracker for COMPLETED rows with result data
+// that haven't yet landed in Qualified_Leads, checks them against the agent's
+// qualification rules (read LIVE from the Agents sheet), and batch-appends
+// the qualifying ones.
+//
+// Rules live in Google Sheets → Agents tab:
+//   • "Qualification Field"  + "Qualification Values"  → simple field∈values check
+//   • "Qualification Rules"  (JSON array)              → multi-field AND logic
+//
+// To update who qualifies for any agent: edit those columns in the Agents sheet.
+// No deploy, no restart — takes effect on the next 10-min cycle.
+//
+// This job runs even when pollActiveBatches is idle (e.g. outside polling hours)
+// so any backlog from overnight completions is cleared first thing in the morning.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function autoQualifyLeads(agentCodeFilter = null) {
+  const label = '[auto-qualify]';
+  try {
+    const agents = (await getAllAgents()).filter(a => a.active);
+    const targets = agentCodeFilter ? agents.filter(a => a.agentCode === agentCodeFilter) : agents;
+    const users = await getAllUsers();
+    const userRoleMap = buildUserRoleMap(users);
+    const { headers: trigHeaders, rows: trigRows } = await _getTriggerLog();
+    const triggerMap = trigHeaders.length ? buildTriggerMap(trigRows, trigHeaders) : {};
+
+    let grandTotal = 0;
+    for (const agent of targets) {
+      try {
+        const added = await _syncAgentQL(agent, userRoleMap, triggerMap);
+        if (added > 0) {
+          console.log(`${label} ${agent.agentCode}: +${added} leads pushed to Qualified_Leads`);
+          grandTotal += added;
+        }
+      } catch (err) {
+        console.error(`${label} Error on ${agent.agentCode}:`, err.message);
+      }
+    }
+    if (grandTotal > 0) console.log(`${label} Total: +${grandTotal} qualified leads this run`);
+    else console.log(`${label} No new qualified leads found`);
+  } catch (err) {
+    console.error(`${label} Fatal:`, err.message);
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function backfillMissingOutputs(agentCodeFilter = null) {
@@ -1952,7 +1959,7 @@ function getStatus() {
   return {
     pollRunning,
     lastPollTime,
-    lastPollStats,  // per-agent: { fetched, updated, errors, qlAdded, pollCap, backfillCap }
+    lastPollStats,  // per-agent: { fetched, updated, errors, pollCap, backfillCap }
     jobStats,
     pollBudget: POLL_BUDGET,  // current budget config — tune POLL_GLOBAL / BACKFILL_GLOBAL etc.
     uptime: Math.round(process.uptime()),
@@ -1983,6 +1990,12 @@ async function startPoller() {
   // Backfill every 15 minutes (offset by 7 min from poll to avoid overlap)
   cron.schedule('7,22,37,52 * * * *', async () => {
     try { await backfillMissingOutputs(); } catch (e) { console.error('[cron:backfill]', e.message); }
+  });
+
+  // Auto-qualify every 10 minutes (offset 4 min to avoid colliding with poll + backfill)
+  // Reads qualification rules LIVE from Agents sheet — no restart needed when rules change.
+  cron.schedule('4,14,24,34,44,54 * * * *', async () => {
+    try { await autoQualifyLeads(); } catch (e) { console.error('[cron:qualify]', e.message); }
   });
 
   // Repair unassigned leads every 20 minutes
@@ -2039,6 +2052,7 @@ async function startPoller() {
 module.exports = {
   startPoller,
   pollActiveBatches,
+  autoQualifyLeads,
   backfillMissingOutputs,
   repairUnassignedLeads,
   cleanupExpiredSessions,
