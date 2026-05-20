@@ -182,9 +182,7 @@ async function _scanAgentWork(agent) {
 
     const LIVE_STATUSES = new Set(['INITIATED', 'IN_PROGRESS', 'SCHEDULED', 'NOT_STARTED', 'RINGING']);
     const resultFields  = resultFieldNames(agent.resultSchema);
-    const activeHours   = _isActiveHours();
-
-    for (const row of rows) {
+        for (const row of rows) {
       const status = String(row[statusCol] || '').toUpperCase();
 
       // CANCELLED — Hunar never updates these, skip always
