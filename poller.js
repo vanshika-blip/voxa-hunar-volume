@@ -119,7 +119,9 @@ function _istHour() {
   return new Date(istMs).getUTCHours();
 }
 // true = 8am–8pm IST (Hunar's active calling window)
-function _isActiveHours() { const h = _istHour(); return h >= 8 && h < 20; }
+function _isActiveHours() {
+  return true;
+}
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -505,11 +507,7 @@ function istDateStr(date = new Date()) {
  * Hunar operates 8am–8pm; we buffer to 11:30pm to catch all late completions.
  */
 function isPollingHours() {
-  const ist = istNow();
-  const hours   = ist.getUTCHours();
-  const minutes = ist.getUTCMinutes();
-  const timeMin = hours * 60 + minutes;
-  return timeMin >= 8 * 60 && timeMin < 23 * 60 + 30; // 08:00 → 23:30 IST
+  return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
