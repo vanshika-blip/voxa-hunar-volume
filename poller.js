@@ -101,12 +101,15 @@ let jobStats      = {};
 
 const POLL_BUDGET = {
   // ── Live-poll budget (INITIATED / IN_PROGRESS / SCHEDULED / NOT_STARTED) ──
-  POLL_GLOBAL:     400,   // total Hunar API slots for live polling across all agents/cycle
-  POLL_MAX_CAP:    300,   // hard ceiling per single agent for live polling
+  // Reduced from 400/300 → quota was being fully exhausted every cycle,
+  // blocking user-facing login/API requests which share the same Sheets quota.
+  POLL_GLOBAL:      80,   // total Hunar API slots for live polling across all agents/cycle
+  POLL_MAX_CAP:     60,   // hard ceiling per single agent for live polling
 
   // ── Backfill budget (COMPLETED rows missing result data) ──────────────────
-  BACKFILL_GLOBAL:  200,  // total Hunar API slots for backfill across all agents/cycle
-  BACKFILL_MAX_CAP: 150,  // hard ceiling per single agent for backfill
+  // Reduced from 200/150 → backfill runs on its own 15-min cron, doesn't need large caps
+  BACKFILL_GLOBAL:  30,   // total Hunar API slots for backfill across all agents/cycle
+  BACKFILL_MAX_CAP: 25,   // hard ceiling per single agent for backfill
 
   // ── Shared ────────────────────────────────────────────────────────────────
   // No MIN_CAP — zero means zero.  Agents only get a slot if they have work.
@@ -528,14 +531,22 @@ async function pollActiveBatches(agentCodeFilter = null) {
         backfillCap: POLL_BUDGET.BACKFILL_MAX_CAP,
       }]]);
     } else {
+      // ── Sequential scan with small gaps ─────────────────────────────────
+      // Previously used Promise.all which fired 9 Sheets reads simultaneously,
+      // creating a quota burst at the start of every cycle and blocking login
+      // requests that share the same Sheets API quota pool.
+      // Sequential with 300ms gaps spreads the reads over ~3s instead of 0s.
       console.log(`[poll] Scanning work queues across ${targets.length} agents…`);
-      const scanResults = await Promise.all(
-        targets.map(a => _scanAgentWork(a).then(r => ({
+      const scanResults = [];
+      for (const a of targets) {
+        const r = await _scanAgentWork(a);
+        scanResults.push({
           agentCode:      a.agentCode,
           pollNeeded:     r.pollNeeded,
           backfillNeeded: r.backfillNeeded,
-        })))
-      );
+        });
+        await sleep(300); // spread Sheets reads — prevents quota burst
+      }
       agentCaps = computeAgentCaps(scanResults);
 
       // Log: show each agent's scan count → calculated cap
@@ -559,8 +570,9 @@ async function pollActiveBatches(agentCodeFilter = null) {
         const stats = await _pollAgent(agent, userRoleMap, triggerMap, caps.pollCap, caps.backfillCap);
         lastPollStats[agent.agentCode] = { ...stats, pollCap: caps.pollCap, backfillCap: caps.backfillCap };
         console.log(`[poll] ${agent.agentCode}: pollCap=${caps.pollCap} backfillCap=${caps.backfillCap} fetched=${stats.fetched} updated=${stats.updated} errors=${stats.errors}`);
-        // Brief pause between agents to spread quota usage
-        await sleep(1200);
+        // Increased from 1200ms → 2500ms: more breathing room between agents
+        // so Sheets quota recovers before the next agent starts its reads.
+        await sleep(2500);
       } catch (err) {
         console.error(`[poll] Error on ${agent.agentCode}:`, err.message);
       }
@@ -1982,8 +1994,9 @@ async function startPoller() {
     process.exit(1);
   }
 
-  // Poll every 2 minutes
-  cron.schedule('*/2 * * * *', async () => {
+  // Poll every 3 minutes (was 2 min — reduced to give Sheets quota more recovery time
+  // between cycles; with 9 agents and sequential scanning the cycle itself takes ~60-90s)
+  cron.schedule('*/3 * * * *', async () => {
     try { await pollActiveBatches(); } catch (e) { console.error('[cron:poll]', e.message); }
   });
 
