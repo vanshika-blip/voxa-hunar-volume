@@ -100,20 +100,25 @@ let jobStats      = {};
 // ── Tuning knobs (only these need changing) ───────────────────────────────────
 
 const POLL_BUDGET = {
-  // ── Live-poll budget (INITIATED / IN_PROGRESS / SCHEDULED / NOT_STARTED) ──
-  // Reduced from 400/300 → quota was being fully exhausted every cycle,
-  // blocking user-facing login/API requests which share the same Sheets quota.
-  POLL_GLOBAL:      80,   // total Hunar API slots for live polling across all agents/cycle
-  POLL_MAX_CAP:     60,   // hard ceiling per single agent for live polling
-
-  // ── Backfill budget (COMPLETED rows missing result data) ──────────────────
-  // Reduced from 200/150 → backfill runs on its own 15-min cron, doesn't need large caps
-  BACKFILL_GLOBAL:  30,   // total Hunar API slots for backfill across all agents/cycle
-  BACKFILL_MAX_CAP: 25,   // hard ceiling per single agent for backfill
-
-  // ── Shared ────────────────────────────────────────────────────────────────
-  // No MIN_CAP — zero means zero.  Agents only get a slot if they have work.
+  // ── Active hours 8am–8pm IST ───────────────────────────────────────────────
+  POLL_GLOBAL:         25,
+  POLL_MAX_CAP:         8,
+  BACKFILL_GLOBAL:     12,
+  BACKFILL_MAX_CAP:     4,
+  // ── After hours 8pm–8am IST ───────────────────────────────────────────────
+  POLL_GLOBAL_AH:      40,
+  POLL_MAX_CAP_AH:     15,
+  BACKFILL_GLOBAL_AH:  50,
+  BACKFILL_MAX_CAP_AH: 20,
 };
+
+// ── IST time helpers ──────────────────────────────────────────────────────────
+function _istHour() {
+  const istMs = Date.now() + (5.5 * 3600 * 1000);
+  return new Date(istMs).getUTCHours();
+}
+// true = 8am–8pm IST (Hunar's active calling window)
+function _isActiveHours() { const h = _istHour(); return h >= 8 && h < 20; }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -174,14 +179,23 @@ async function _scanAgentWork(agent) {
     const reqIdColIdx  = headers.indexOf('Request ID');
     if (statusCol < 0) return result;
 
-    const LIVE_STATUSES = new Set(['INITIATED', 'IN_PROGRESS', 'SCHEDULED', 'NOT_STARTED']);
+    const LIVE_STATUSES = new Set(['INITIATED', 'IN_PROGRESS', 'SCHEDULED', 'NOT_STARTED', 'RINGING']);
     const resultFields  = resultFieldNames(agent.resultSchema);
+    const activeHours   = _isActiveHours();
 
     for (const row of rows) {
       const status = String(row[statusCol] || '').toUpperCase();
 
-      // Terminal — Hunar will never update these again
-      if (status === 'NOT_CONNECTED' || status === 'FAILED' || status === 'CANCELLED') continue;
+      // CANCELLED — Hunar never updates these, skip always
+      if (status === 'CANCELLED') continue;
+
+      // During active hours: skip NC/FAILED (no retry calls being made yet)
+      // After hours: include NC/FAILED so they get polled for retry triggers
+      if (status === 'NOT_CONNECTED' || status === 'FAILED') {
+        if (activeHours) continue;        // skip during 8am–8pm
+        result.pollNeeded++;              // include after 8pm for after-hours sweep
+        continue;
+      }
 
       if (LIVE_STATUSES.has(status)) {
         result.pollNeeded++;
@@ -223,15 +237,19 @@ async function _scanAgentWork(agent) {
  * Returns Map<agentCode, { pollCap, backfillCap }>
  */
 function computeAgentCaps(scanResults) {
-  const { POLL_GLOBAL, POLL_MAX_CAP, BACKFILL_GLOBAL, BACKFILL_MAX_CAP } = POLL_BUDGET;
+  const active = _isActiveHours();
+  const POLL_G  = active ? POLL_BUDGET.POLL_GLOBAL      : POLL_BUDGET.POLL_GLOBAL_AH;
+  const POLL_C  = active ? POLL_BUDGET.POLL_MAX_CAP     : POLL_BUDGET.POLL_MAX_CAP_AH;
+  const BF_G    = active ? POLL_BUDGET.BACKFILL_GLOBAL  : POLL_BUDGET.BACKFILL_GLOBAL_AH;
+  const BF_C    = active ? POLL_BUDGET.BACKFILL_MAX_CAP : POLL_BUDGET.BACKFILL_MAX_CAP_AH;
 
   const pollCaps     = _allocateBudget(
     scanResults.map(r => ({ agentCode: r.agentCode, count: r.pollNeeded })),
-    POLL_GLOBAL, POLL_MAX_CAP
+    POLL_G, POLL_C
   );
   const backfillCaps = _allocateBudget(
     scanResults.map(r => ({ agentCode: r.agentCode, count: r.backfillNeeded })),
-    BACKFILL_GLOBAL, BACKFILL_MAX_CAP
+    BF_G, BF_C
   );
 
   const combined = new Map();
@@ -675,9 +693,11 @@ async function _pollAgent(agent, userRoleMap, triggerMap, pollCap = POLL_BUDGET.
     const reqId  = reqIdCol >= 0 ? String(row[reqIdCol] || '') : '';
     const campaignDone = reqId ? campaignStatus.get(reqId) === 'COMPLETED' : false;
 
-    // Skip ALL terminal statuses — NOT_CONNECTED, FAILED, CANCELLED never get updated by Hunar again
-    // We discover these by polling SCHEDULED/INITIATED/IN_PROGRESS rows instead
-    if (status === 'NOT_CONNECTED' || status === 'FAILED' || status === 'CANCELLED') continue;
+    // Skip ALL terminal statuses during active hours — NOT_CONNECTED, FAILED, CANCELLED never get updated by Hunar again
+    // After hours (8pm–8am IST): include NOT_CONNECTED + FAILED so after-hours sweep can process retry triggers
+    const isActive = _isActiveHours();
+    if (status === 'CANCELLED') continue;
+    if ((status === 'NOT_CONNECTED' || status === 'FAILED') && isActive) continue;
 
     const hasResult = status === 'COMPLETED' && resultFields.some(f => {
       const col = mtHeaders.indexOf('out.' + f);
@@ -911,13 +931,17 @@ async function _pollAgent(agent, userRoleMap, triggerMap, pollCap = POLL_BUDGET.
 
   }
 
-  // FIX 2: Build merged rows using a Map (O(n)) instead of .find() inside .map() (O(n²))
-  // This avoids creating a huge in-memory copy of all mtRows on every poll cycle
-  if (stats.updated > 0) {
+  // Campaign Tracker refresh strategy:
+  // - Active hours (8am–8pm): SKIP entirely. CT reads 2 Sheets ops per agent per cycle.
+  //   With 5 active agents that's 10 extra ops every 5 min = ~120/hour just for CT stats.
+  //   Users can see live stats directly in the Google Sheet; CT is not user-facing in the portal UI.
+  // - After hours: run every 5th poll cycle to keep CT accurate for daily reports.
+  const active = _isActiveHours();
+  if (!active && stats.updated > 0 && (_pollCycleCount % 5) === 0) {
     const updatedRowMap = new Map(rowUpdates.map(u => [u.rowIndex, u.values]));
     const mergedRows = mtRows.map((r, i) => updatedRowMap.get(i + 2) || r);
     await _refreshCampaignTracker(agent, agentSsId, mtHeaders, mergedRows);
-    updatedRowMap.clear(); // FIX 3: help GC release this memory promptly
+    updatedRowMap.clear();
   }
 
   return stats;
@@ -1994,9 +2018,10 @@ async function startPoller() {
     process.exit(1);
   }
 
-  // Poll every 3 minutes (was 2 min — reduced to give Sheets quota more recovery time
-  // between cycles; with 9 agents and sequential scanning the cycle itself takes ~60-90s)
-  cron.schedule('*/3 * * * *', async () => {
+  // Poll every 5 min.
+  // 8am–8pm IST: live calls only (INITIATED/IN_PROGRESS/RINGING), caps 25/8
+  // 8pm–8am IST: NC+FAILED after-hours sweep, caps 40/15 — backlog clears overnight
+  cron.schedule('*/5 * * * *', async () => {
     try { await pollActiveBatches(); } catch (e) { console.error('[cron:poll]', e.message); }
   });
 
@@ -2005,14 +2030,15 @@ async function startPoller() {
     try { await backfillMissingOutputs(); } catch (e) { console.error('[cron:backfill]', e.message); }
   });
 
-  // Auto-qualify every 10 minutes (offset 4 min to avoid colliding with poll + backfill)
-  // Reads qualification rules LIVE from Agents sheet — no restart needed when rules change.
-  cron.schedule('4,14,24,34,44,54 * * * *', async () => {
+  // Auto-qualify every 30 min (was 10 min).
+  // ql-sync reads 500+ rows per agent — was the #1 quota drain at peak.
+  // The poll job already pushes leads inline; ql-sync is just a safety net.
+  cron.schedule('2,32 * * * *', async () => {
     try { await autoQualifyLeads(); } catch (e) { console.error('[cron:qualify]', e.message); }
   });
 
-  // Repair unassigned leads every 20 minutes
-  cron.schedule('*/20 * * * *', async () => {
+  // Repair unassigned leads every 30 min
+  cron.schedule('*/30 * * * *', async () => {
     try { await repairUnassignedLeads(); } catch (e) { console.error('[cron:repair]', e.message); }
   });
 
