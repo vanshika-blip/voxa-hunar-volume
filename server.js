@@ -489,16 +489,22 @@ function agentsVisibleTo(actor, agents, users = []) {
   if (actor.role === 'super_admin') return active;
 
   if (actor.role === 'team_lead' || actor.role === 'individual_contributor') {
-    // Primary: agents explicitly created by this user
-    // Secondary: agents with no createdBy (bulk-pasted) — visible to all TL-like roles
-    // Tertiary: agents created by anyone on same team
     const sameTeamEmails = new Set(
       users.filter(u => u.team === actor.team && u.active && isTLLike(u.role)).map(u => u.email)
     );
+    // If mergeAgentDuplicates deactivated this TL's row and kept a canonical row
+    // created by another TL, the user loses visibility. Fix: check if this TL
+    // ever added the same Hunar agent (via addedById) — active OR inactive row.
+    const myHunarIds = new Set(
+      agents
+        .filter(a => a.createdBy === actor.email && a.addedById && a.agentId)
+        .map(a => a.agentId)
+    );
     return active.filter(a =>
-      a.createdBy === actor.email ||          // their own agents
-      !a.createdBy ||                          // bulk-pasted (no owner) — visible to all
-      sameTeamEmails.has(a.createdBy)          // same team member's agents
+      a.createdBy === actor.email ||           // their own canonical row
+      !a.createdBy ||                           // bulk-pasted (no owner)
+      sameTeamEmails.has(a.createdBy) ||        // same team member created it
+      (a.addedById && myHunarIds.has(a.agentId)) // they added this Hunar agent; row was merged
     );
   }
 
@@ -507,8 +513,16 @@ function agentsVisibleTo(actor, agents, users = []) {
     const tlEmails = new Set(
       users.filter(u => u.team === actor.team && u.active && isTLLike(u.role)).map(u => u.email)
     );
+    // Same merge-awareness for recruiter: check if any TL on their team ever added this agent
+    const teamHunarIds = new Set(
+      agents
+        .filter(a => tlEmails.has(a.createdBy) && a.addedById && a.agentId)
+        .map(a => a.agentId)
+    );
     return active.filter(a =>
-      tlEmails.has(a.createdBy) || !a.createdBy  // team's agents + unowned agents
+      tlEmails.has(a.createdBy) ||
+      !a.createdBy ||
+      (a.addedById && teamHunarIds.has(a.agentId))
     );
   }
   return [];
