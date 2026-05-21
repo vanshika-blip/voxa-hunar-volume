@@ -467,9 +467,12 @@ function isQualified(agent, result) {
       if (!rule.field) return true;
       const val = result[rule.field];
       if (!val && val !== 0) return false;
+      const low = String(val).toLowerCase();
+      // excludeKeywords checked FIRST — any match = disqualified
+      const excl = (rule.excludeKeywords || []).filter(Boolean);
+      if (excl.length && excl.some(k => low.includes(String(k).toLowerCase()))) return false;
       const kws = (rule.keywords || []).filter(Boolean);
       if (!kws.length) return !!val;
-      const low = String(val).toLowerCase();
       return kws.some(k => low.includes(String(k).toLowerCase()));
     });
   }
@@ -775,6 +778,20 @@ async function handleUpsertUser(actor, body) {
   const row = [u.email, u.name || u.email, u.role, u.team || '', Number(u.dailyMinuteLimit || 0), false, '', '', tok, exp, new Date().toISOString(), actor.email];
   await appendRows(MAIN_SS_ID, S.USERS, [row]);
   _usersCache = null;
+
+  // Create per-user daily stats sheet in main SS (usr_<email_slug>)
+  // GAS _gasComputeUserStats() writes today's row here every 15 min.
+  (async () => {
+    try {
+      const USER_DAILY_H = ['Date', 'Calls', 'Minutes Used', 'Daily Limit', 'Usage %', 'Updated At'];
+      const uSlug = 'usr_' + u.email.replace(/[^a-z0-9]/gi, '_').slice(0, 28);
+      await ensureSheet(MAIN_SS_ID, uSlug, USER_DAILY_H, '#374151');
+      console.log(`[upsertUser] Created per-user sheet: ${uSlug} for ${u.email}`);
+    } catch (e) {
+      console.warn(`[upsertUser] Could not create per-user sheet for ${u.email}:`, e.message);
+    }
+  })();
+
   const url  = `${DASHBOARD_URL}/?token=${encodeURIComponent(tok)}`;
   sendEmail(u.email, "You're invited to the Portal", inviteEmailHtml({ email: u.email, name: u.name || u.email, role: u.role, team: u.team || '' }, url, false)).catch(() => {});
   audit(actor.email, 'create_user', u.email, '').catch(() => {});
@@ -2063,6 +2080,21 @@ async function handleSetupSheets(actor) {
   return { ok: true, message: 'Main SS sheets ready.' };
 }
 
+async function handleForceQualify(actor, body) {
+  if (!isTLLike(actor.role)) return { ok: false, error: 'FORBIDDEN' };
+  const agentCode = String(body.agentCode || '').trim();
+  // Delegate to the Node poller's autoQualifyLeads which already has full QL-sync logic
+  // (reads MT → checks qualificationRules incl. excludeKeywords → appends to QL).
+  // Runs immediately, synchronously from the caller's perspective.
+  try {
+    await autoQualifyLeads(agentCode || null);
+    audit(actor.email, 'force_qualify', agentCode || 'all', '').catch(() => {});
+    return { ok: true, message: `Force-qualify ran for ${agentCode || 'all agents'}` };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
 async function handleDedupeNow(actor) {
   if (actor.role !== 'super_admin') return { ok: false, error: 'FORBIDDEN' };
   try { const r = await dedupeAllSheets(); return { ok: true, ...r }; } catch (e) { return { ok: false, error: e.message }; }
@@ -2131,6 +2163,7 @@ async function handleAction(body) {
     case 'resolvesupportquery':  return handleResolveSupportQuery(actor, body);
     case 'setupsheets':          return handleSetupSheets(actor);
     case 'dedupeleadsnow':       return handleDedupeNow(actor);
+    case 'forcequalifyleads':    return handleForceQualify(actor, body);
     case 'pollnow':              return actor.role === 'super_admin' ? (pollActiveBatches().catch(() => {}), { ok: true, message: 'Poll triggered.' }) : { ok: false, error: 'FORBIDDEN' };
     case 'backfillnow':          return actor.role === 'super_admin' ? (backfillMissingOutputs().catch(() => {}), { ok: true, message: 'Backfill triggered.' }) : { ok: false, error: 'FORBIDDEN' };
     case 'killjobs':             return { ok: true, message: 'Use Render dashboard to stop the server.' };

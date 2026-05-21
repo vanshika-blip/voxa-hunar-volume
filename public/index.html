@@ -1043,7 +1043,7 @@ function DashboardView({ user, agents, selectedAgent, setSelectedAgent }) {
   }
 
   useEffect(()=>{ setDashData(null); setUsageData(null); setMinutesData(null); loadWithParams(customDates, range, selectedAgent); },[range,selectedAgent,customDates.join(",")]);
-  useEffect(()=>{ const t=setInterval(load,5*60*1000); return()=>clearInterval(t); },[range,selectedAgent,customDates.join(",")]);
+  // Auto-refresh removed: data is served from GAS _Dashboard_Cache (refreshed every 15 min)
 
   if(!dashData||!usageData) return <div style={{display:"flex",justifyContent:"center",padding:60}}><Spin/></div>;
   const s = dashData.stats||{};
@@ -1492,11 +1492,7 @@ function LeadsView({ user, users, agents, teams, initialFilter, onClearFilter })
   }
 
   useEffect(()=>{ refresh(); },[selAgent, search, unassignedOnly, reqFilter]);
-  useEffect(()=>{
-    if(!selAgent) return;
-    const t = setInterval(()=>{ invalidateLeadCache(selAgent); refresh(); }, 5*60*1000);
-    return ()=>clearInterval(t);
-  },[selAgent, search, unassignedOnly, reqFilter]);
+  // Auto-refresh removed: use the manual Refresh button to reload leads
 
   const fixedCols = ["Callee Name","Mobile Number","Started At","Assigned To Email","Call Status","Feedback","Remarks","Recording URL"];
   const dateCols = headers.filter(h => isDateCol(h) && !fixedCols.includes(h));
@@ -3470,10 +3466,7 @@ function InterviewLineupView({ user }) {
     if (r.ok) setRows(r.rows || []);
   }
   useEffect(() => { load(); }, []);
-  useEffect(() => {
-    const t = setInterval(load, 5 * 60 * 1000);
-    return () => clearInterval(t);
-  }, []);
+  // Auto-refresh removed: use the manual Refresh button to reload
 
   async function handleUpdate(callId, field, value) {
     if (!callId) return;
@@ -4034,10 +4027,7 @@ function ManualTrackerView({ user }) {
   }
   // On unmount, flush any pending
   useEffect(()=>()=>{ Object.keys(debounceRef.current).forEach(id => clearTimeout(debounceRef.current[id])); },[]);
-  useEffect(()=>{
-    const t = setInterval(load, 5 * 60 * 1000);
-    return ()=>clearInterval(t);
-  },[]);
+  // Auto-refresh removed: use the manual Refresh button to reload
 
   // Per-cell save state: { "uid|fieldName": "saving"|"ok" }
   const [cellSaveState, setCellSaveState] = useState({});

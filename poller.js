@@ -475,9 +475,12 @@ function isQualified(agent, result) {
       if (!rule.field) return true;
       const val = result[rule.field];
       if (!val) return false;
+      const lower = String(val).toLowerCase();
+      // excludeKeywords checked FIRST — any match = disqualified
+      const excl = Array.isArray(rule.excludeKeywords) ? rule.excludeKeywords.filter(Boolean) : [];
+      if (excl.length && excl.some(kw => lower.includes(String(kw).toLowerCase()))) return false;
       const keywords = Array.isArray(rule.keywords) ? rule.keywords.filter(Boolean) : [];
       if (!keywords.length) return !!val;
-      const lower = String(val).toLowerCase();
       return keywords.some(kw => lower.includes(String(kw).toLowerCase()));
     });
   }
@@ -1160,19 +1163,30 @@ async function _refreshCampaignTracker(agent, agentSsId, mtHeaders, mtRows) {
     const reqIdCol  = mtHeaders.indexOf('Request ID');
     const statusCol = mtHeaders.indexOf('Status');
     const durCol    = mtHeaders.indexOf('Duration (Minutes)');
+    const abiCol    = mtHeaders.indexOf('Answered By');   // for connected count
     const ctReqCol  = ctHeaders.indexOf('Request ID');
+    const ccIdx     = ctHeaders.indexOf('Contacts Count'); // campaign target from CT row
 
     const stats = {};
     mtRows.forEach(r => {
       const rid = String(r[reqIdCol] || '');
       if (!rid) return;
-      if (!stats[rid]) stats[rid] = { total: 0, completed: 0, notConnected: 0, failed: 0, minutes: 0, qualified: 0 };
+      if (!stats[rid]) stats[rid] = { total: 0, completed: 0, notConnected: 0, failed: 0, minutes: 0, qualified: 0, connected: 0 };
       stats[rid].total++;
       const s = String(r[statusCol] || '').toUpperCase();
-      if (s === 'COMPLETED')  { stats[rid].completed++; }
+      if (s === 'COMPLETED') {
+        stats[rid].completed++;
+        stats[rid].minutes += Number(r[durCol] || 0);
+        // Connected = call was actually answered (Answered By non-empty).
+        // Falls back to counting all COMPLETED if the column is absent.
+        if (abiCol >= 0) {
+          if (String(r[abiCol] || '').trim()) stats[rid].connected++;
+        } else {
+          stats[rid].connected++;
+        }
+      }
       if (s === 'NOT_CONNECTED') stats[rid].notConnected++;
       if (s === 'FAILED' || s === 'CANCELLED') stats[rid].failed++;
-      stats[rid].minutes += Number(r[durCol] || 0);
     });
 
     // Count QL per request
@@ -1185,28 +1199,37 @@ async function _refreshCampaignTracker(agent, agentSsId, mtHeaders, mtRows) {
       });
     }
 
-    const ctStatusColIdx = ctHeaders.indexOf('Status');
     const updates = [];
     ctRows.forEach((r, idx) => {
       const rid = String(r[ctReqCol] || '');
       const s = stats[rid];
       if (!s) return;
+
+      // FIX: use Contacts Count from CT row as the completion target.
+      // s.total is only the rows currently seeded in MT — if seeding is still
+      // in progress done >= s.total would mark COMPLETED prematurely.
+      const contactsTarget = ccIdx >= 0 && Number(r[ccIdx] || 0) > 0
+        ? Number(r[ccIdx])
+        : s.total;
+
       const done = s.completed + s.notConnected + s.failed;
-      const newStatus = done >= s.total ? 'COMPLETED' : 'IN_PROGRESS';
+      const newStatus = done >= contactsTarget && s.total >= contactsTarget
+        ? 'COMPLETED'
+        : 'IN_PROGRESS';
+
       const newRow = [...r];
       const set = (name, val) => { const k = ctHeaders.indexOf(name); if (k >= 0) newRow[k] = val; };
-      set('Status',       newStatus);
-      set('Completed',    s.completed);
-      set('Connected',    s.completed);
+      set('Status',        newStatus);
+      set('Completed',     s.completed);
+      set('Connected',     s.connected);   // FIX: actual answered count
       set('Not Connected', s.notConnected);
-      set('Failed',       s.failed);
-      set('Qualified',    s.qualified);
+      set('Failed',        s.failed);
+      set('Qualified',     s.qualified);
       set('Actual Minutes', Math.round(s.minutes * 100) / 100);
-      set('Last Updated', new Date().toISOString());
+      set('Last Updated',  new Date().toISOString());
       updates.push({ rowIndex: idx + 2, values: newRow });
     });
 
-    // Single batchWriteRows call instead of N individual writes (quota fix)
     if (updates.length) {
       await batchWriteRows(agent.spreadsheetId || MAIN_SS_ID, ctName, updates);
     }
