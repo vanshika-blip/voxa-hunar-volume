@@ -1482,7 +1482,11 @@ async function handleGetDashboard(actor, body) {
 
           totalCalls += c.completed + c.nc + c.failed;
           totalMins  += c.minutes;
-          qualCount  += c.qualified;
+          // super_admin: use cached aggregate (fast).
+          // recruiter/TL/IC: count per-row from QL with RBAC filter below.
+          // Recruiters never trigger campaigns → trigSet is empty for them →
+          // c.qualified would always be 0 here even for their assigned leads.
+          if (actor.role === 'super_admin') qualCount += c.qualified;
         }
 
         // Daily chart from _DailyStats
@@ -1493,7 +1497,7 @@ async function handleGetDashboard(actor, body) {
           byDay[d.date].qualified += d.qualified;
         }
 
-        // lineupCount: still needs QL Feedback — lightweight read (only 2 cols needed)
+        // qualCount (non-admin) + lineupCount: always read QL with proper RBAC.
         try {
           const { headers: qh, rows: qr } = await readSheet(a.spreadsheetId, AGT.QL);
           if (qh.length) {
@@ -1503,6 +1507,7 @@ async function handleGetDashboard(actor, body) {
               const assigned = String(r[aec] || '').toLowerCase();
               if ((actor.role === 'recruiter' || actor.role === 'individual_contributor') && assigned !== actor.email) return;
               if (actor.role === 'team_lead' && assigned && !visEmails.has(assigned)) return;
+              if (actor.role !== 'super_admin') qualCount++;
               const fb = String(r[fbc] || '').toLowerCase();
               if (_isInterviewLinedUp(fb)) lineupCount++;
             });

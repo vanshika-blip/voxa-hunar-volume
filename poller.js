@@ -2140,6 +2140,25 @@ async function startPoller() {
   }, 5000);
 }
 
+/**
+ * Schedule a targeted poll for a single agent after a delay.
+ * Called after a campaign is triggered so results are fetched promptly
+ * without waiting for the next full 5-min poll cycle.
+ *
+ * @param {string} agentCode  The agent to poll
+ * @param {number} delayMs    Milliseconds to wait before polling (default 10 min)
+ */
+function scheduleAgentPoll(agentCode, delayMs = 10 * 60 * 1000) {
+  setTimeout(async () => {
+    try {
+      console.log(`[scheduleAgentPoll] Running targeted poll for ${agentCode}`);
+      await pollActiveBatches(agentCode);
+    } catch (e) {
+      console.error(`[scheduleAgentPoll] Error polling ${agentCode}:`, e.message);
+    }
+  }, delayMs);
+}
+
 module.exports = {
   startPoller,
   pollActiveBatches,
@@ -2161,4 +2180,5 @@ module.exports = {
   getAllAgents,
   getAllUsers,
   getAllTeams,
+  scheduleAgentPoll,
 };
