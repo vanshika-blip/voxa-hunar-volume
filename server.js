@@ -35,7 +35,8 @@ const {
   processCallbackQueue, processRetryQueue,
   getArchivedLeads, getArchivedMT, getArchivedManual,
   getStatus,
-  scheduleAgentPoll,  // ← NEW
+  scheduleAgentPoll,
+  registerFreshCampaign,
 } = require('./poller');
 
 const app  = express();
@@ -1107,7 +1108,9 @@ async function handleUploadContacts(actor, body) {
   // Schedule a dedicated poll for this agent 10 min from now.
   // By T+10 most calls have left the INITIATED state, so one targeted sweep
   // captures the whole batch result without waiting for 2–3 general cycles.
-  scheduleAgentPoll(agentCode, 10 * 60 * 1000);
+  // Register campaign for intensive 10-min poll window, then 3-hour backoff
+  registerFreshCampaign(agentCode, requestId);
+  scheduleAgentPoll(agentCode, 2 * 60 * 1000); // first targeted poll after 2 min
 
   return { ok: true, agentCode, requestId: reqId, contactsSubmitted: rows.length, contactsAccepted: calls.length, estimatedMinutes: Math.round(estMin * 100) / 100 };
 }
@@ -1155,18 +1158,6 @@ async function handleGetLeads(actor, body) {
       allLeads.push(...leads);
     } catch (_) {}
   }
-
-  // Deduplicate by Call ID — guards against duplicate rows in the sheet
-  // (can occur when autoQualifyLeads and pollActiveBatches race to append)
-  const seenCallIds = new Set();
-  allLeads = allLeads.filter(l => {
-    const cid = String(l['Call ID'] || '').trim();
-    if (!cid) return true; // keep rows with no Call ID (edge case)
-    if (seenCallIds.has(cid)) return false;
-    seenCallIds.add(cid);
-    return true;
-  });
-
   return { ok: true, leads: allLeads, headers, agentCode };
 }
 
@@ -1405,210 +1396,156 @@ async function handleGetCampaigns(actor, body) {
 }
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
-const METRICS_SHEET      = '_Metrics';
-const DAILY_STATS_SHEET  = '_DailyStats';
-const METRICS_STALE_MS   = 15 * 60 * 1000; // treat metrics as stale after 15 min
+//
+// FAST PATH: reads _Dashboard_Cache written by GAS every 15 min (gas_background.js).
+// One Sheets read instead of scanning all agent spreadsheets.
+// Falls back to full MT+QL scan if cache is missing or empty (first boot).
+//
+// _Dashboard_Cache columns:
+//   Date | Team | Agent Code | Triggered By | Request ID |
+//   Calls | Minutes | Qualified | Lineup | Updated At
 
-/**
- * Try to read pre-computed _Metrics and _DailyStats for an agent.
- * Returns null if the sheets don't exist or are too stale to trust.
- */
-async function _readAgentMetrics(ssId, sinceDate) {
-  try {
-    const { headers: mh, rows: mr } = await readSheet(ssId, METRICS_SHEET);
-    if (!mh.length || !mr.length) return null;
-
-    // Check freshness via the Last Updated column
-    const luCol = mh.indexOf('Last Updated');
-    if (luCol >= 0) {
-      const freshest = mr.reduce((best, r) => {
-        const t = new Date(r[luCol] || 0).getTime();
-        return t > best ? t : best;
-      }, 0);
-      if (Date.now() - freshest > METRICS_STALE_MS) return null; // too stale
-    }
-
-    // Index _Metrics columns
-    const mi = h => mh.indexOf(h);
-    const campaigns = mr.map(r => ({
-      requestId:   String(r[mi('Request ID')]    || ''),
-      triggeredBy: String(r[mi('Triggered By')]  || '').toLowerCase(),
-      triggeredAt: String(r[mi('Triggered At')]  || ''),
-      status:      String(r[mi('Status')]        || ''),
-      total:       Number(r[mi('Total')]         || 0),
-      completed:   Number(r[mi('Completed')]     || 0),
-      nc:          Number(r[mi('Not Connected')] || 0),
-      failed:      Number(r[mi('Failed')]        || 0),
-      qualified:   Number(r[mi('Qualified')]     || 0),
-      minutes:     Number(r[mi('Minutes')]       || 0),
-    }));
-
-    // Read _DailyStats
-    const { headers: dh, rows: dr } = await readSheet(ssId, DAILY_STATS_SHEET);
-    const di  = h => dh.indexOf(h);
-    const daily = dh.length ? dr.map(r => ({
-      date:      String(r[di('Date')]      || ''),
-      calls:     Number(r[di('Calls')]     || 0),
-      minutes:   Number(r[di('Minutes')]   || 0),
-      qualified: Number(r[di('Qualified')] || 0),
-    })).filter(d => d.date && new Date(d.date) >= sinceDate) : [];
-
-    return { campaigns, daily };
-  } catch (_) {
-    return null; // silently fall back to full scan
-  }
-}
+const DASH_CACHE_SHEET = '_Dashboard_Cache';
 
 async function handleGetDashboard(actor, body) {
-  const range  = body.range || '7d';
-  const days   = range === 'today' ? 0 : range === '30d' ? 30 : 7;
-  const agents = await getAllAgents();
-  const users  = await getAllUsers();
-  const vis    = agentsVisibleTo(actor, agents, users);
+  const range   = body.range || '7d';
+  const days    = range === 'today' ? 0 : range === '30d' ? 30 : 7;
+  const users   = await getAllUsers();
+  const agents  = await getAllAgents();
   const visEmails = new Set(visibleUserEmails(actor, users).map(e => e.toLowerCase()));
+  const vis     = agentsVisibleTo(actor, agents, users);
 
   const sinceDate = range === 'today'
     ? new Date(new Date().toLocaleDateString('en-CA', { timeZone: IST_TZ }) + 'T00:00:00+05:30')
     : new Date(Date.now() - days * 86400_000);
 
-  // Build trigger set for non-admin RBAC (same as original)
-  let trigSet = new Set();
-  if (actor.role !== 'super_admin') {
-    try {
-      const { headers: th, rows: tr } = await readSheet(MAIN_SS_ID, S.TLOG);
-      if (th.length) {
-        const ei = th.indexOf('User Email'); const ai = th.indexOf('Agent Code'); const ri = th.indexOf('Request ID');
-        tr.forEach(r => { if (visEmails.has(String(r[ei] || '').toLowerCase())) trigSet.add(`${r[ai]}|${r[ri]}`); });
-      }
-    } catch (_) {}
-  }
-
+  // ── Try cache (fast path) ──────────────────────────────────────────────────
   let totalCalls = 0, totalMins = 0, qualCount = 0, lineupCount = 0;
   const byDay = {};
-  const agentFilter = String(body.agentCode || '');
-  const targets = agentFilter ? vis.filter(a => a.agentCode === agentFilter) : vis;
+  let usedCache = false;
 
-  for (const a of targets) {
-    if (!a.spreadsheetId) continue;
-    try {
-      // ── FAST PATH: read pre-computed _Metrics / _DailyStats ─────────────
-      const cached = await _readAgentMetrics(a.spreadsheetId, sinceDate);
+  try {
+    const { headers: ch, rows: cr } = await readSheet(MAIN_SS_ID, DASH_CACHE_SHEET);
+    if (ch.length && cr.length) {
+      const gi = h => ch.indexOf(h);
+      const visAgentCodes = new Set(vis.map(a => a.agentCode));
 
-      if (cached) {
-        // Use pre-computed data — no full MT/QL scan needed
-        for (const c of cached.campaigns) {
-          // RBAC: non-admins only see campaigns they or their team triggered
-          if (actor.role !== 'super_admin' && !trigSet.has(`${a.agentCode}|${c.requestId}`)) continue;
+      cr.forEach(r => {
+        const dateStr    = String(r[gi('Date')]         || '');
+        const agentCode  = String(r[gi('Agent Code')]   || '');
+        const triggeredBy = String(r[gi('Triggered By')] || '').toLowerCase();
+        const reqId      = String(r[gi('Request ID')]   || '');
 
-          // Filter by date range: triggeredAt must be within the range
-          if (c.triggeredAt) {
-            const tAt = new Date(c.triggeredAt);
-            if (!isNaN(tAt.getTime()) && tAt < sinceDate) continue;
-          }
+        if (!dateStr || !agentCode) return;
 
-          totalCalls += c.completed + c.nc + c.failed;
-          totalMins  += c.minutes;
-          // super_admin: use cached aggregate (fast).
-          // recruiter/TL/IC: count per-row from QL with RBAC filter below.
-          // Recruiters never trigger campaigns → trigSet is empty for them →
-          // c.qualified would always be 0 here even for their assigned leads.
-          if (actor.role === 'super_admin') qualCount += c.qualified;
+        // Date range filter
+        const d = new Date(dateStr);
+        if (isNaN(d.getTime()) || d < sinceDate) return;
+
+        // Visibility filter
+        if (!visAgentCodes.has(agentCode)) return;
+        if (actor.role !== 'super_admin') {
+          // non-admin: only rows triggered by visible users
+          if (!visEmails.has(triggeredBy)) return;
         }
 
-        // Daily chart from _DailyStats
-        for (const d of cached.daily) {
-          byDay[d.date] = byDay[d.date] || { calls: 0, minutes: 0, qualified: 0 };
-          byDay[d.date].calls     += d.calls;
-          byDay[d.date].minutes   += d.minutes;
-          byDay[d.date].qualified += d.qualified;
-        }
+        const calls     = Number(r[gi('Calls')]     || 0);
+        const minutes   = Number(r[gi('Minutes')]   || 0);
+        const qualified = Number(r[gi('Qualified')] || 0);
+        const lineup    = Number(r[gi('Lineup')]    || 0);
 
-        // qualCount (non-admin) + lineupCount: always read QL with proper RBAC.
-        try {
-          const { headers: qh, rows: qr } = await readSheet(a.spreadsheetId, AGT.QL);
-          if (qh.length) {
-            const aec = qh.indexOf('Assigned To Email');
-            const fbc = qh.indexOf('Feedback');
-            qr.forEach(r => {
-              const assigned = String(r[aec] || '').toLowerCase();
-              if ((actor.role === 'recruiter' || actor.role === 'individual_contributor') && assigned !== actor.email) return;
-              if (actor.role === 'team_lead' && assigned && !visEmails.has(assigned)) return;
-              if (actor.role !== 'super_admin') qualCount++;
-              const fb = String(r[fbc] || '').toLowerCase();
-              if (_isInterviewLinedUp(fb)) lineupCount++;
-            });
-          }
-        } catch (_) {}
+        totalCalls += calls;
+        totalMins  += minutes;
+        qualCount  += qualified;
+        lineupCount += lineup;
 
-        continue; // done with this agent — skip the full scan below
-      }
-
-      // ── SLOW PATH (fallback): original full MT/QL row scan ───────────────
-      // Used when _Metrics doesn't exist yet or is stale (e.g. first server boot)
-      const { headers: mh, rows: mr } = await readSheet(a.spreadsheetId, AGT.MT);
-      if (!mh.length) continue;
-      const ri = mh.indexOf('Request ID'); const di = mh.indexOf('Duration (Minutes)');
-      const si = mh.indexOf('Started At');  const ci = mh.indexOf('Created At');
-      mr.forEach(r => {
-        const rid = String(r[ri] || '');
-        if (actor.role !== 'super_admin' && !trigSet.has(`${a.agentCode}|${rid}`)) return;
-        const dv = r[si] || r[ci]; if (!dv) return;
-        const d = new Date(dv); if (isNaN(d.getTime()) || d < sinceDate) return;
-        const day = d.toLocaleDateString('en-CA', { timeZone: IST_TZ });
-        totalCalls++;
-        const dur = Math.round(Number(r[di] || 0) * 100) / 100;
-        totalMins += dur;
-        byDay[day] = byDay[day] || { calls: 0, minutes: 0, qualified: 0 };
-        byDay[day].calls++; byDay[day].minutes += dur;
+        if (!byDay[dateStr]) byDay[dateStr] = { calls: 0, minutes: 0, qualified: 0 };
+        byDay[dateStr].calls     += calls;
+        byDay[dateStr].minutes   += minutes;
+        byDay[dateStr].qualified += qualified;
       });
 
-      const { headers: qh, rows: qr } = await readSheet(a.spreadsheetId, AGT.QL);
-      if (!qh.length) continue;
-      const aec = qh.indexOf('Assigned To Email'); const fbc = qh.indexOf('Feedback'); const dac = qh.indexOf('Date Added');
-      qr.forEach(r => {
-        const assigned = String(r[aec] || '').toLowerCase();
-        if ((actor.role === 'recruiter' || actor.role === 'individual_contributor') && assigned !== actor.email) return;
-        if (actor.role === 'team_lead' && assigned && !visEmails.has(assigned)) return;
-        qualCount++;
-        const fb = String(r[fbc] || '').toLowerCase();
-        if (_isInterviewLinedUp(fb)) lineupCount++;
-        if (dac >= 0 && r[dac]) {
-          const d = new Date(r[dac]);
-          if (!isNaN(d.getTime()) && d >= sinceDate) {
-            const day = d.toLocaleDateString('en-CA', { timeZone: IST_TZ });
-            byDay[day] = byDay[day] || { calls: 0, minutes: 0, qualified: 0 };
-            byDay[day].qualified = (byDay[day].qualified || 0) + 1;
-          }
-        }
-      });
-    } catch (_) {}
+      usedCache = true;
+      console.log('[dashboard] Served from _Dashboard_Cache (' + cr.length + ' rows)');
+    }
+  } catch (_) {
+    // Cache not available — fall through to full scan
   }
 
-  // ── Manual Tracker stats (from central SS) ───────────────────────────────
+  // ── Slow path: full MT + QL scan (fallback when cache is empty) ────────────
+  if (!usedCache) {
+    console.log('[dashboard] Cache miss — running full MT+QL scan');
+    let trigSet = new Set();
+    if (actor.role !== 'super_admin') {
+      try {
+        const { headers: th, rows: tr } = await readSheet(MAIN_SS_ID, S.TLOG);
+        if (th.length) {
+          const ei = th.indexOf('User Email'); const ai = th.indexOf('Agent Code'); const ri = th.indexOf('Request ID');
+          tr.forEach(r => { if (visEmails.has(String(r[ei] || '').toLowerCase())) trigSet.add(r[ai] + '|' + r[ri]); });
+        }
+      } catch (_) {}
+    }
+
+    for (const a of vis) {
+      if (!a.spreadsheetId) continue;
+      try {
+        const { headers: mh, rows: mr } = await readSheet(a.spreadsheetId, AGT.MT);
+        if (!mh.length) continue;
+        const ri = mh.indexOf('Request ID'); const di = mh.indexOf('Duration (Minutes)');
+        const si = mh.indexOf('Started At');  const ci = mh.indexOf('Created At');
+        mr.forEach(r => {
+          const rid = String(r[ri] || '');
+          if (actor.role !== 'super_admin' && !trigSet.has(a.agentCode + '|' + rid)) return;
+          const dv = r[si] || r[ci]; if (!dv) return;
+          const d = new Date(dv); if (isNaN(d.getTime()) || d < sinceDate) return;
+          const day = d.toLocaleDateString('en-CA', { timeZone: IST_TZ });
+          totalCalls++;
+          const dur = Math.round(Number(r[di] || 0) * 100) / 100;
+          totalMins += dur;
+          byDay[day] = byDay[day] || { calls: 0, minutes: 0, qualified: 0 };
+          byDay[day].calls++; byDay[day].minutes += dur;
+        });
+
+        const { headers: qh, rows: qr } = await readSheet(a.spreadsheetId, AGT.QL);
+        if (!qh.length) continue;
+        const aec = qh.indexOf('Assigned To Email'); const fbc = qh.indexOf('Feedback'); const dac = qh.indexOf('Date Added');
+        qr.forEach(r => {
+          const assigned = String(r[aec] || '').toLowerCase();
+          if ((actor.role === 'recruiter' || actor.role === 'individual_contributor') && assigned !== actor.email) return;
+          if (actor.role === 'team_lead' && assigned && !visEmails.has(assigned)) return;
+          if (actor.role !== 'super_admin') qualCount++;
+          const fb = String(r[fbc] || '').toLowerCase();
+          if (_isInterviewLinedUp(fb)) lineupCount++;
+          if (dac >= 0 && r[dac]) {
+            const d = new Date(r[dac]);
+            if (!isNaN(d.getTime()) && d >= sinceDate) {
+              const day = d.toLocaleDateString('en-CA', { timeZone: IST_TZ });
+              byDay[day] = byDay[day] || { calls: 0, minutes: 0, qualified: 0 };
+              byDay[day].qualified = (byDay[day].qualified || 0) + 1;
+            }
+          }
+        });
+      } catch (_) {}
+    }
+  }
+
+  // ── Manual Tracker stats ───────────────────────────────────────────────────
   let manualTotal = 0, manualConnected = 0, manualLinedUp = 0;
   const manualByTeam = {};
-
   if (MANUAL_TRACKER_SS_ID) {
     try {
       const visTeams = actor.role === 'super_admin'
         ? (await getAllTeams()).map(t => t.name)
         : [actor.team].filter(Boolean);
-
       for (const teamName of visTeams) {
         try {
           const { headers, rows } = await readSheet(MANUAL_TRACKER_SS_ID, teamName);
           if (!headers.length) continue;
-          const csi = headers.indexOf('Call Status');
-          const lui = headers.indexOf('Lined-up');
-          const dti = headers.indexOf('Date');
-          const aei = headers.indexOf('Added By Email');
-
+          const csi = headers.indexOf('Call Status'), lui = headers.indexOf('Lined-up');
+          const dti = headers.indexOf('Date'), aei = headers.indexOf('Added By Email');
           let tTotal = 0, tConn = 0, tLined = 0;
           rows.forEach(r => {
-            if (dti >= 0 && r[dti]) {
-              const d = new Date(r[dti]);
-              if (!isNaN(d.getTime()) && d < sinceDate) return;
-            }
+            if (dti >= 0 && r[dti]) { const d = new Date(r[dti]); if (!isNaN(d.getTime()) && d < sinceDate) return; }
             if ((actor.role === 'recruiter' || actor.role === 'individual_contributor') && aei >= 0) {
               if (String(r[aei] || '').toLowerCase() !== actor.email) return;
             }
@@ -1616,25 +1553,21 @@ async function handleGetDashboard(actor, body) {
             if (csi >= 0 && String(r[csi] || '').toLowerCase().includes('connected')) tConn++;
             if (lui >= 0 && String(r[lui] || '').toLowerCase() === 'yes') tLined++;
           });
-
-          manualTotal    += tTotal;
-          manualConnected += tConn;
-          manualLinedUp   += tLined;
+          manualTotal += tTotal; manualConnected += tConn; manualLinedUp += tLined;
           manualByTeam[teamName] = { total: tTotal, connected: tConn, linedUp: tLined };
         } catch (_) {}
       }
     } catch (_) {}
   }
 
-  // ── Lineup stats (from central SS) ────────────────────────────────────────
-  let lineupTotal = 0, lineupByTeam = {};
-
+  // ── Lineup stats ───────────────────────────────────────────────────────────
+  let lineupTotal = 0;
+  const lineupByTeam = {};
   if (LINEUP_SS_ID) {
     try {
       const visTeams = actor.role === 'super_admin'
         ? (await getAllTeams()).map(t => t.name)
         : [actor.team].filter(Boolean);
-
       for (const teamName of visTeams) {
         try {
           const { headers, rows } = await readSheet(LINEUP_SS_ID, teamName);
@@ -1643,10 +1576,7 @@ async function handleGetDashboard(actor, body) {
           const dti = headers.indexOf('Date Added');
           let count = 0;
           rows.forEach(r => {
-            if (dti >= 0 && r[dti]) {
-              const d = new Date(r[dti]);
-              if (!isNaN(d.getTime()) && d < sinceDate) return;
-            }
+            if (dti >= 0 && r[dti]) { const d = new Date(r[dti]); if (!isNaN(d.getTime()) && d < sinceDate) return; }
             if ((actor.role === 'recruiter' || actor.role === 'individual_contributor') && aei >= 0) {
               if (String(r[aei] || '').toLowerCase() !== actor.email) return;
             }
@@ -1668,32 +1598,70 @@ async function handleGetDashboard(actor, body) {
       totalCalls, totalMinutes: Math.round(totalMins * 100) / 100,
       qualifiedLeads: qualCount, lineupCount,
       conversionRate: qualCount > 0 ? Math.round(lineupCount / qualCount * 1000) / 10 : 0,
-      manual: {
-        total: manualTotal,
-        connected: manualConnected,
-        linedUp: manualLinedUp,
-        byTeam: manualByTeam,
-      },
+      manual: { total: manualTotal, connected: manualConnected, linedUp: manualLinedUp, byTeam: manualByTeam },
       lineup: { total: lineupTotal, byTeam: lineupByTeam },
-      combined: {
-        totalLeads:   qualCount + manualTotal,
-        totalLinedUp: lineupCount + manualLinedUp,
-      },
+      combined: { totalLeads: qualCount + manualTotal, totalLinedUp: lineupCount + manualLinedUp },
     },
     timeSeries,
+    _source: usedCache ? 'cache' : 'full_scan',
   };
 }
 
 async function handleGetUsage(actor) {
   const users = await getAllUsers();
   const vis   = new Set(visibleUserEmails(actor, users));
+  const ub    = {};
+  users.forEach(u => { ub[u.email] = u; });
+  const today   = istDateStr();
+  const mtdFrom = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+
+  // ── Fast path: read _Recruiter_Cache written by GAS every 15 min ──────────
+  try {
+    const { headers: rh, rows: rr } = await readSheet(MAIN_SS_ID, '_Recruiter_Cache');
+    if (rh.length && rr.length) {
+      const gi = h => rh.indexOf(h);
+      const mbd = {}, mtu = {}, cbd = {}, ctu = {};
+
+      rr.forEach(r => {
+        const email = String(r[gi('Email')] || '').toLowerCase().trim();
+        if (!email || !vis.has(email)) return;
+        const dateStr = String(r[gi('Date')] || '');
+        const calls   = Number(r[gi('Calls')]   || 0);
+        const minutes = Number(r[gi('Minutes')] || 0);
+        const key = email + '|' + dateStr;
+        mbd[key] = (mbd[key] || 0) + minutes;
+        cbd[key] = (cbd[key] || 0) + calls;
+        const d = new Date(dateStr);
+        if (!isNaN(d.getTime()) && d >= mtdFrom) {
+          mtu[email] = (mtu[email] || 0) + minutes;
+          ctu[email] = (ctu[email] || 0) + calls;
+        }
+      });
+
+      const recruiterMinutes = [...vis].map(em => {
+        const u = ub[em]; if (!u) return null;
+        const tm = mbd[em + '|' + today] || 0;
+        return {
+          email: em, name: u.name, team: u.team, role: u.role,
+          dailyLimit: u.dailyMinuteLimit,
+          todayMinutes: Math.round(tm * 100) / 100,
+          mtdMinutes:   Math.round((mtu[em] || 0) * 100) / 100,
+          todayCalls:   cbd[em + '|' + today] || 0,
+          mtdCalls:     ctu[em] || 0,
+          todayUsagePct: u.dailyMinuteLimit > 0 ? Math.round(tm / u.dailyMinuteLimit * 100) : 0,
+        };
+      }).filter(Boolean).filter(r => r.mtdMinutes > 0 || r.todayMinutes > 0);
+      recruiterMinutes.sort((a, b) => b.mtdMinutes - a.mtdMinutes);
+      return { ok: true, recruiterMinutes, _source: 'cache' };
+    }
+  } catch (_) {}
+
+  // ── Slow path: scan Trigger Log directly (fallback) ────────────────────────
   try {
     const { headers: th, rows: tr } = await readSheet(MAIN_SS_ID, S.TLOG);
     if (!th.length) return { ok: true, recruiterMinutes: [] };
     const ei = th.indexOf('User Email'); const ti = th.indexOf('Timestamp');
     const mi = th.indexOf('Estimated Minutes'); const ci = th.indexOf('Contacts Count');
-    const today   = istDateStr();
-    const mtdFrom = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
     const mbd = {}, mtu = {}, cbd = {}, ctu = {};
     tr.forEach(r => {
       const em = String(r[ei] || '').toLowerCase().trim();
@@ -1701,30 +1669,26 @@ async function handleGetUsage(actor) {
       const d = new Date(r[ti] || 0); if (isNaN(d.getTime())) return;
       const day = d.toLocaleDateString('en-CA', { timeZone: IST_TZ });
       const mins = Number(r[mi] || 0); const calls = Number(r[ci] || 0);
-      const dk = `${em}|${day}`;
+      const dk = em + '|' + day;
       mbd[dk] = (mbd[dk] || 0) + mins; cbd[dk] = (cbd[dk] || 0) + calls;
       if (d >= mtdFrom) { mtu[em] = (mtu[em] || 0) + mins; ctu[em] = (ctu[em] || 0) + calls; }
     });
-    const ub = {};
-    users.forEach(u => { ub[u.email] = u; });
     const recruiterMinutes = [...vis].map(em => {
       const u = ub[em]; if (!u) return null;
-      const tm = mbd[`${em}|${today}`] || 0;
+      const tm = mbd[em + '|' + today] || 0;
       return {
         email: em, name: u.name, team: u.team, role: u.role,
         dailyLimit: u.dailyMinuteLimit,
         todayMinutes: Math.round(tm * 100) / 100,
         mtdMinutes:   Math.round((mtu[em] || 0) * 100) / 100,
-        todayCalls:   cbd[`${em}|${today}`] || 0,
-        mtdCalls:     ctu[em] || 0,
+        todayCalls:   cbd[em + '|' + today] || 0, mtdCalls: ctu[em] || 0,
         todayUsagePct: u.dailyMinuteLimit > 0 ? Math.round(tm / u.dailyMinuteLimit * 100) : 0,
       };
     }).filter(Boolean).filter(r => r.mtdMinutes > 0 || r.todayMinutes > 0);
     recruiterMinutes.sort((a, b) => b.mtdMinutes - a.mtdMinutes);
-    return { ok: true, recruiterMinutes };
+    return { ok: true, recruiterMinutes, _source: 'full_scan' };
   } catch (e) { return { ok: false, error: e.message }; }
 }
-
 // ─── Manual Tracker ────────────────────────────────────────────────────────────
 async function handleGetManualTracker(actor, body) {
   const teamName = actor.role === 'super_admin' ? String(body.team || '') : actor.team;

@@ -76,7 +76,38 @@ const CB_KEYWORDS = ['call back', 'callback', 'call-back', 'ring back', 'follow 
 // ─── Runtime state ────────────────────────────────────────────────────────────
 
 let pollRunning   = false;
-let _pollCycleCount = 0; // increments each poll run, used for SCHEDULED throttling
+let _pollCycleCount = 0;
+
+// ── Fresh-campaign registry ───────────────────────────────────────────────────
+// When a campaign is triggered, it's registered here. The poll loop gives it
+// aggressive coverage for 10 min, then backs off to every 3 hours.
+const _freshCampaigns = new Map(); // key='agentCode|reqId' → { triggeredAt, lastPolledAt }
+const FRESH_WINDOW_MS       = 10 * 60 * 1000;       // 10 min  — poll every cycle
+const STALE_POLL_INTERVAL_MS = 3 * 60 * 60 * 1000;  // 3 hours — poll once per 3h after that
+
+function registerFreshCampaign(agentCode, requestId) {
+  const key = agentCode + '|' + requestId;
+  _freshCampaigns.set(key, { triggeredAt: Date.now(), lastPolledAt: 0 });
+  console.log(`[poll] Fresh campaign registered: ${key} (10-min intensive window starts now)`);
+}
+
+function _shouldPollRequest(reqId, agentCode, isToday) {
+  if (!reqId) return isToday; // no reqId → fall back to today-only heuristic
+  const key = agentCode + '|' + reqId;
+  const entry = _freshCampaigns.get(key);
+
+  if (entry) {
+    const age = Date.now() - entry.triggeredAt;
+    if (age < FRESH_WINDOW_MS) return true; // still in 10-min window — always poll
+    // Past 10 min: only poll if 3h have elapsed since last poll
+    const shouldPoll = Date.now() - entry.lastPolledAt > STALE_POLL_INTERVAL_MS;
+    if (shouldPoll) entry.lastPolledAt = Date.now();
+    return shouldPoll;
+  }
+
+  // Not in registry (campaign pre-dates this server start): fall back to today heuristic
+  return isToday;
+} // increments each poll run, used for SCHEDULED throttling
 let lastPollTime  = null;
 let lastPollStats = {};
 let jobStats      = {};
@@ -723,11 +754,11 @@ if (status === 'CANCELLED' || status === 'NOT_CONNECTED' || status === 'FAILED')
     const campaignDate  = triggeredAtMs ? istDateStr(new Date(triggeredAtMs)) : '';
     const isToday       = campaignDate === todayStr;
 
-    // SCHEDULED: throttle previous-day campaigns to every 20th cycle (~40 min)
-    // Today's SCHEDULED are always included so fresh triggers aren't delayed.
-    // NOT_STARTED is always included regardless of day (fires immediately on trigger).
-    if (priority === 4 && !isToday) {
-      if ((_pollCycleCount % 20) !== (i % 20)) continue;
+    // Fresh campaigns (registered within 10 min): always include.
+    // Stale campaigns: only poll once every 3 hours.
+    // NOT_STARTED always passes (fires immediately on trigger regardless of age).
+    if (status !== 'NOT_STARTED' && priority !== 0) {
+      if (!_shouldPollRequest(reqId, agent.agentCode, isToday)) continue;
     }
 
     candidates.push({ i, row, callId, status, reqId, priority, campaignDone, isToday, triggeredAtMs });
@@ -1001,20 +1032,7 @@ if (pollPass.length > 0) {
 
 
 
-// Per-agent QL sync lock — prevents autoQualifyLeads and pollActiveBatches
-// from running _syncAgentQL concurrently for the same agent, which caused
-// both to read the same QL snapshot and append identical rows (duplicates).
-const _qlSyncLocks = new Set();
-
 async function _syncAgentQL(agent, userRoleMap, triggerMap) {
-  // If a sync is already running for this agent, skip — the in-flight run
-  // will pick up any new qualified rows when it re-reads MT.
-  if (_qlSyncLocks.has(agent.agentCode)) {
-    console.log(`[ql-sync] ${agent.agentCode}: skipping — sync already in progress`);
-    return 0;
-  }
-  _qlSyncLocks.add(agent.agentCode);
-  try {
   const agentSsId = agent.spreadsheetId || MAIN_SS_ID;
   const mtName    = agent.spreadsheetId ? AGT.MASTER_TRACKER  : (agent.agentCode + AGT.MASTER_TRACKER);
   const qlName    = agent.spreadsheetId ? AGT.QUALIFIED_LEADS : (agent.agentCode + AGT.QUALIFIED_LEADS);
@@ -1129,9 +1147,6 @@ async function _syncAgentQL(agent, userRoleMap, triggerMap) {
   }
 
   return toAppend.length;
-  } finally {
-    _qlSyncLocks.delete(agent.agentCode);
-  }
 }
 
 async function _refreshCampaignTracker(agent, agentSsId, mtHeaders, mtRows) {
@@ -1293,6 +1308,15 @@ async function _backfillAgent(agent) {
   const customVars   = agent.customVariables || [];
 
   if (callIdCol < 0 || !resultFields.length) return { missing: 0, filled: 0 };
+
+  // Skip backfill if the agent has qualification rules defined.
+  // Qualification rules work on result data already present in the MT row —
+  // if result fields are empty the call won't qualify anyway, so fetching again
+  // is redundant. Backfill is only meaningful for agents with no qual rules where
+  // we need the raw result data for manual review.
+  const hasQualRules = (agent.qualificationRules && agent.qualificationRules.length > 0) ||
+                       (agent.qualificationField && agent.qualificationField.trim());
+  if (hasQualRules) return { missing: 0, filled: 0 };
 
   const { headers: qlHeaders, rows: qlRows } = await readSheet(agent.spreadsheetId || MAIN_SS_ID, qlName);
   const qlCallIdCol  = qlHeaders.indexOf('Call ID');
@@ -2098,17 +2122,9 @@ async function startPoller() {
     try { await backfillMissingOutputs(); } catch (e) { console.error('[cron:backfill]', e.message); }
   });
 
-  // Auto-qualify every 30 min (was 10 min).
-  // ql-sync reads 500+ rows per agent — was the #1 quota drain at peak.
-  // The poll job already pushes leads inline; ql-sync is just a safety net.
-  cron.schedule('2,32 * * * *', async () => {
-    try { await autoQualifyLeads(); } catch (e) { console.error('[cron:qualify]', e.message); }
-  });
-
-  // Repair unassigned leads every 30 min
-  cron.schedule('*/30 * * * *', async () => {
-    try { await repairUnassignedLeads(); } catch (e) { console.error('[cron:repair]', e.message); }
-  });
+  // autoQualifyLeads + repairUnassignedLeads removed from Node cron.
+  // GAS now handles QL push, NC push, and CT refresh every 5 min (gas_background.js).
+  // This eliminates ~14 extra Sheets reads per 30-min cycle from the service-account quota.
 
   // Cleanup sessions every hour
   cron.schedule('0 * * * *', async () => {
@@ -2116,25 +2132,11 @@ async function startPoller() {
   });
 
   // Daily jobs in IST (cron uses UTC, IST = UTC+5:30)
-  // 1am IST = 19:30 UTC previous day
-  cron.schedule('30 19 * * *', async () => {
-    try { await dedupeAllSheets(); } catch (e) { console.error('[cron:dedupe]', e.message); }
-  });
-
-  // 2am IST = 20:30 UTC previous day
-  cron.schedule('30 20 * * *', async () => {
-    try { await archiveCompletedLeads(); } catch (e) { console.error('[cron:archLeads]', e.message); }
-  });
-
-  // 3am IST = 21:30 UTC previous day
-  cron.schedule('30 21 * * *', async () => {
-    try { await archiveCompletedMT(); } catch (e) { console.error('[cron:archMT]', e.message); }
-  });
-
-  // 4am IST = 22:30 UTC previous day
-  cron.schedule('30 22 * * *', async () => {
-    try { await archiveManualTracker(); } catch (e) { console.error('[cron:archManual]', e.message); }
-  });
+  // NOTE: dedupeAllSheets, archiveCompletedLeads, archiveCompletedMT, archiveManualTracker
+  // have been removed from the Node cron. Reasons:
+  //   • Archive: no longer needed — each agent/team has its own SS; data doesn't overflow
+  //   • Dedupe: moved to GAS (gas_background.js) where it runs on Google quota
+  // These functions are kept in code for manual invocation if needed but NOT scheduled.
 
   // 11am IST = 5:30 UTC
   cron.schedule('30 5 * * *', async () => {
@@ -2199,4 +2201,5 @@ module.exports = {
   getAllUsers,
   getAllTeams,
   scheduleAgentPoll,
+  registerFreshCampaign,
 };
