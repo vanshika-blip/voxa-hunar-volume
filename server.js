@@ -134,7 +134,7 @@ function verifyPassword(pw, salt, stored) {
 
 // ─── Sheet data loaders ───────────────────────────────────────────────────────
 async function getAllUsers(force = false) {
-  if (!force && _usersCache && Date.now() - _usersCacheAt < 60_000) return _usersCache;
+  if (!force && _usersCache && Date.now() - _usersCacheAt < 180_000) return _usersCache;
   const { headers, rows } = await readSheet(MAIN_SS_ID, S.USERS);
   if (!headers.length) return (_usersCache = []);
   const idx = h => headers.indexOf(h);
@@ -177,7 +177,7 @@ async function writeUserFields(email, partial) {
 }
 
 async function getAllAgents(force = false) {
-  if (!force && _agentsCache && Date.now() - _agentsCacheAt < 120_000) return _agentsCache;
+  if (!force && _agentsCache && Date.now() - _agentsCacheAt < 300_000) return _agentsCache;
   const { headers, rows } = await readSheet(MAIN_SS_ID, S.AGENTS);
   if (!headers.length) return (_agentsCache = []);
   const idx = h => headers.indexOf(h);
@@ -279,7 +279,7 @@ async function writeAgentRow(agent) {
 }
 
 async function getAllTeams(force = false) {
-  if (!force && _teamsCache && Date.now() - _teamsCacheAt < 120_000) return _teamsCache;
+  if (!force && _teamsCache && Date.now() - _teamsCacheAt < 300_000) return _teamsCache;
   const { headers, rows } = await readSheet(MAIN_SS_ID, S.TEAMS);
   if (!headers.length) return (_teamsCache = []);
   const idx = h => headers.indexOf(h);

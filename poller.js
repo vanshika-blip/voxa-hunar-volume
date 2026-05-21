@@ -2134,10 +2134,12 @@ async function startPoller() {
 
   console.log('[poller] All 11 jobs scheduled ✓');
 
-  // Run poll immediately on startup
+  // Delay startup poll by 3 min — lets the server handle user traffic first
+  // and avoids quota storms from simultaneous agent scans on every restart.
+  console.log('[poller] Startup poll deferred 3 min to avoid quota storm on boot.');
   setTimeout(() => {
     pollActiveBatches().catch(e => console.error('[startup poll]', e.message));
-  }, 5000);
+  }, 3 * 60 * 1000);
 }
 
 /**
