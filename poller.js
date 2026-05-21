@@ -1001,7 +1001,20 @@ if (pollPass.length > 0) {
 
 
 
+// Per-agent QL sync lock — prevents autoQualifyLeads and pollActiveBatches
+// from running _syncAgentQL concurrently for the same agent, which caused
+// both to read the same QL snapshot and append identical rows (duplicates).
+const _qlSyncLocks = new Set();
+
 async function _syncAgentQL(agent, userRoleMap, triggerMap) {
+  // If a sync is already running for this agent, skip — the in-flight run
+  // will pick up any new qualified rows when it re-reads MT.
+  if (_qlSyncLocks.has(agent.agentCode)) {
+    console.log(`[ql-sync] ${agent.agentCode}: skipping — sync already in progress`);
+    return 0;
+  }
+  _qlSyncLocks.add(agent.agentCode);
+  try {
   const agentSsId = agent.spreadsheetId || MAIN_SS_ID;
   const mtName    = agent.spreadsheetId ? AGT.MASTER_TRACKER  : (agent.agentCode + AGT.MASTER_TRACKER);
   const qlName    = agent.spreadsheetId ? AGT.QUALIFIED_LEADS : (agent.agentCode + AGT.QUALIFIED_LEADS);
@@ -1116,6 +1129,9 @@ async function _syncAgentQL(agent, userRoleMap, triggerMap) {
   }
 
   return toAppend.length;
+  } finally {
+    _qlSyncLocks.delete(agent.agentCode);
+  }
 }
 
 async function _refreshCampaignTracker(agent, agentSsId, mtHeaders, mtRows) {

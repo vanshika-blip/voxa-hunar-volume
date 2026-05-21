@@ -1155,6 +1155,18 @@ async function handleGetLeads(actor, body) {
       allLeads.push(...leads);
     } catch (_) {}
   }
+
+  // Deduplicate by Call ID — guards against duplicate rows in the sheet
+  // (can occur when autoQualifyLeads and pollActiveBatches race to append)
+  const seenCallIds = new Set();
+  allLeads = allLeads.filter(l => {
+    const cid = String(l['Call ID'] || '').trim();
+    if (!cid) return true; // keep rows with no Call ID (edge case)
+    if (seenCallIds.has(cid)) return false;
+    seenCallIds.add(cid);
+    return true;
+  });
+
   return { ok: true, leads: allLeads, headers, agentCode };
 }
 
