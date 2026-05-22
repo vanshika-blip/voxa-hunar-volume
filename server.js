@@ -1126,7 +1126,7 @@ async function handleUploadContacts(actor, body) {
   // By T+10 most calls have left the INITIATED state, so one targeted sweep
   // captures the whole batch result without waiting for 2–3 general cycles.
   // Register campaign for intensive 10-min poll window, then 3-hour backoff
-  registerFreshCampaign(agentCode, requestId);
+  registerFreshCampaign(agentCode, reqId);
   scheduleAgentPoll(agentCode, 2 * 60 * 1000); // first targeted poll after 2 min
 
   return { ok: true, agentCode, requestId: reqId, contactsSubmitted: rows.length, contactsAccepted: calls.length, estimatedMinutes: Math.round(estMin * 100) / 100 };
@@ -1148,7 +1148,11 @@ async function handleGetLeads(actor, body) {
   const visEmails = new Set(visibleUserEmails(actor, users).map(e => e.toLowerCase()));
   const agentCode = String(body.agentCode || '').trim();
   const filter    = body.filter || {};
-  const targets   = agentCode ? vis.filter(a => a.agentCode === agentCode) : vis;
+  // Dedupe agents by spreadsheetId — multiple agent rows can share one ssId
+  // when two users add the same Hunar agent via addAgentById. Reading the same
+  // sheet twice produces duplicate leads rows.
+  const rawTargets = agentCode ? vis.filter(a => a.agentCode === agentCode) : vis;
+  const targets    = dedupeAgentsBySsId(rawTargets);
   let allLeads = [];
   let headers  = [];
   for (const agent of targets) {
@@ -1175,6 +1179,15 @@ async function handleGetLeads(actor, body) {
       allLeads.push(...leads);
     } catch (_) {}
   }
+  // Safety-net: dedupe by Call ID in case any slipped through
+  const seenIds = new Set();
+  allLeads = allLeads.filter(l => {
+    const id = String(l['Call ID'] || '').trim();
+    if (!id) return true;
+    if (seenIds.has(id)) return false;
+    seenIds.add(id);
+    return true;
+  });
   return { ok: true, leads: allLeads, headers, agentCode };
 }
 
@@ -1384,21 +1397,28 @@ async function handleGetCampaigns(actor, body) {
   const emailToTeam = {};
   users.forEach(u => { if (u.team) emailToTeam[u.email] = u.team; });
   const agentCode = String(body.agentCode || '').trim();
-  const targets   = agentCode ? vis.filter(a => a.agentCode === agentCode) : vis;
-  const campaigns = [];
-  for (const a of targets) {
+  // Dedupe by ssId — same sheet must not be read twice
+  const rawTargets2 = agentCode ? vis.filter(a => a.agentCode === agentCode) : vis;
+  const targets2    = dedupeAgentsBySsId(rawTargets2);
+  let campaigns = [];
+  const seenReqIds = new Set();
+  for (const a of targets2) {
     if (!a.spreadsheetId) continue;
     try {
       const { rows } = await readSheet(a.spreadsheetId, AGT.CT);
       rows.forEach(r => {
         if (!r[0]) return;
+        const reqId = String(r[0]).trim();
+        // Dedupe by requestId — same campaign must not appear twice
+        if (seenReqIds.has(reqId)) return;
+        seenReqIds.add(reqId);
         const by = String(r[2] || '').toLowerCase().trim();
         if (actor.role === 'recruiter' && by !== actor.email) return;
         if (actor.role === 'individual_contributor' && by !== actor.email) return;
         if (actor.role === 'team_lead' && !visEmails.has(by)) return;
         campaigns.push({
           agentCode: a.agentCode, agentName: a.displayName,
-          requestId: String(r[0]), campaignName: String(r[1] || ''),
+          requestId: reqId, campaignName: String(r[1] || ''),
           triggeredBy: by, triggeredByTeam: emailToTeam[by] || '',
           triggeredAt: r[3], contactsCount: r[4], status: r[5],
           completed: r[6], connected: r[7], notConnected: r[8], failed: r[9],
@@ -2298,3 +2318,15 @@ app.listen(PORT, () => {
   });
   console.log('[server] Keepalive ping scheduled (every 5 min) ✓');
 });
+// Deduplicate a list of agents by spreadsheetId so the same sheet is never
+// read twice. When multiple agent rows share one ssId (happens when two users
+// add the same Hunar agent via addAgentById), keep only the first occurrence.
+function dedupeAgentsBySsId(agents) {
+  const seen = new Set();
+  return agents.filter(a => {
+    if (!a.spreadsheetId) return true;
+    if (seen.has(a.spreadsheetId)) return false;
+    seen.add(a.spreadsheetId);
+    return true;
+  });
+}
