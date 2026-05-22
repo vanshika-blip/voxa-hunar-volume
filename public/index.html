@@ -1084,7 +1084,7 @@ function DashboardView({ user, agents, selectedAgent, setSelectedAgent }) {
           <div className="t-mast-title">Dashboard</div>
           <div className="t-mast-sub" style={{display:"flex",alignItems:"center",gap:10}}>
             <span>{customDates.length>0?`${customDates.length} date${customDates.length>1?"s":""} selected`:range==="today"?"Today":range==="7d"?"Last 7 days":"Last 30 days"}</span>
-            <span className="refresh-badge"><span className="refresh-dot"/>Auto-refresh 5m</span>
+            
           </div>
         </div>
         <div className="t-mast-r">
@@ -1641,7 +1641,7 @@ function LeadsView({ user, users, agents, teams, initialFilter, onClearFilter })
           <div className="t-mast-title">Leads</div>
           <div className="t-mast-sub" style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
             <span>{filteredLeads.length} leads {hasFilters && `(filtered)`}</span>
-            <span className="refresh-badge"><span className="refresh-dot"/>Auto-refresh 5m</span>
+            
             {lastRefresh && <span style={{fontSize:9,color:"rgba(255,255,255,.3)"}}>Last: {lastRefresh.toLocaleTimeString()}</span>}
             {reqFilter && <>
               <span style={{fontFamily:"var(--fm)",fontSize:10,background:"rgba(255,255,255,.1)",padding:"1px 5px"}}>campaign: {reqFilter.slice(-12)}</span>
