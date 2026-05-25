@@ -1969,6 +1969,129 @@ async function _seedMasterTracker(agent, createdCalls, requestId, triggeredBy) {
 // fetches ALL non-terminal rows with no cap — cleans up end-of-day stragglers
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ─── Dashboard Cache Rebuild (runs after EOD sweep) ──────────────────────────
+// Scans ALL active agent MT + QL sheets and writes fresh rows to _Dashboard_Cache.
+// Equivalent to GAS forceRebuildAllCaches() but runs entirely in Node.
+// Columns: Date|Team|Agent Code|Triggered By|Request ID|Calls|Minutes|Qualified|Lineup|Updated At|Connected
+
+const DASH_CACHE_SHEET = '_Dashboard_Cache';
+const DASH_CACHE_H = ['Date','Team','Agent Code','Triggered By','Request ID','Calls','Minutes','Qualified','Lineup','Updated At','Connected'];
+
+async function _rebuildDashboardCache() {
+  console.log('[rebuildCache] Starting _Dashboard_Cache rebuild…');
+  const t0 = Date.now();
+
+  const agents = (await getAllAgents()).filter(a => a.active && a.spreadsheetId);
+  const users  = await getAllUsers();
+  const umap   = {};
+  users.forEach(u => { umap[u.email.toLowerCase()] = u; });
+
+  // Build trigger maps
+  const trigMap  = {}; // agentCode|reqId → email
+  const trigTeam = {}; // agentCode|reqId → team
+  try {
+    const { headers: th, rows: tr } = await readSheet(MAIN_SS_ID, PORTAL.TRIGGER_LOG);
+    if (th.length) {
+      const ei = th.indexOf('User Email'), ai = th.indexOf('Agent Code');
+      const ri = th.indexOf('Request ID'), ti = th.indexOf('Team');
+      tr.forEach(r => {
+        const key = String(r[ai] || '') + '|' + String(r[ri] || '');
+        if (ei >= 0) trigMap[key]  = String(r[ei] || '').toLowerCase();
+        if (ti >= 0) trigTeam[key] = String(r[ti] || '');
+      });
+    }
+  } catch (e) { console.warn('[rebuildCache] TriggerLog read failed:', e.message); }
+
+  const CUTOFF_DAYS = 60; // keep 60 days of history
+  const cutoffStr = new Date(Date.now() - CUTOFF_DAYS * 86400_000)
+    .toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
+  const agg = {}; // key → { date, team, agent, email, reqId, calls, minutes, qualified, lineup, connected }
+
+  // Dedupe by spreadsheetId
+  const seen = new Set();
+  const deduped = agents.filter(a => {
+    if (!a.spreadsheetId || seen.has(a.spreadsheetId)) return false;
+    seen.add(a.spreadsheetId); return true;
+  });
+
+  for (const agent of deduped) {
+    try {
+      // ── Master Tracker ────────────────────────────────────────────────────
+      const { headers: mh, rows: mr } = await readSheet(agent.spreadsheetId, AGT.MASTER_TRACKER);
+      if (!mh.length) continue;
+      const si  = mh.indexOf('Status'), ri = mh.indexOf('Request ID');
+      const di  = mh.indexOf('Duration (Minutes)');
+      const sai = mh.indexOf('Started At'), cai = mh.indexOf('Created At');
+      const abi = mh.indexOf('Answered By');
+      const rf  = resultFieldNames(agent.resultSchema);
+
+      mr.forEach(row => {
+        if (String(row[si] || '').toUpperCase() !== 'COMPLETED') return;
+        const reqId = ri >= 0 ? String(row[ri] || '').trim() : '';
+        const email = trigMap[agent.agentCode + '|' + reqId] || '';
+        const team  = trigTeam[agent.agentCode + '|' + reqId] || umap[email]?.team || '';
+        const dv = (sai >= 0 ? row[sai] : null) || (cai >= 0 ? row[cai] : null);
+        if (!dv) return;
+        let d; try { d = new Date(dv); if (isNaN(d.getTime())) return; } catch (_) { return; }
+        const dateStr = d.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        if (dateStr < cutoffStr) return;
+
+        const key = `${dateStr}|${team}|${agent.agentCode}|${email}|${reqId}`;
+        if (!agg[key]) agg[key] = { date: dateStr, team, agent: agent.agentCode, email, reqId, calls: 0, minutes: 0, qualified: 0, lineup: 0, connected: 0 };
+        agg[key].calls++;
+        agg[key].minutes += Number(row[di] || 0);
+        const isConn = abi >= 0 ? !!String(row[abi] || '').trim() : true;
+        if (isConn) agg[key].connected++;
+
+        const result = {};
+        rf.forEach(f => { const col = mh.indexOf('out.' + f); result[f] = col >= 0 ? row[col] : ''; });
+        if (isQualified(agent, result)) agg[key].qualified++;
+      });
+
+      await sleep(300);
+
+      // ── Qualified Leads ───────────────────────────────────────────────────
+      const { headers: qh, rows: qr } = await readSheet(agent.spreadsheetId, AGT.QUALIFIED_LEADS);
+      if (!qh.length) continue;
+      const fbi = qh.indexOf('Feedback'), qri = qh.indexOf('Request ID');
+      const qai = qh.indexOf('Assigned To Email'), qda = qh.indexOf('Date Added');
+
+      qr.forEach(row => {
+        const fb = String(fbi >= 0 ? row[fbi] || '' : '').toLowerCase();
+        if (!fb.includes('interview lined up') && !fb.includes('interested: interview') &&
+            !fb.includes('interested - interview') && !fb.includes('interested \u2013 interview')) return;
+        const reqId = qri >= 0 ? String(row[qri] || '').trim() : '';
+        const email = qai >= 0 ? String(row[qai] || '').toLowerCase() : trigMap[agent.agentCode + '|' + reqId] || '';
+        const team  = trigTeam[agent.agentCode + '|' + reqId] || umap[email]?.team || '';
+        let dateStr = '';
+        if (qda >= 0 && row[qda]) {
+          try { dateStr = new Date(row[qda]).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }); } catch (_) {}
+        }
+        const key = `${dateStr}|${team}|${agent.agentCode}|${email}|${reqId}`;
+        if (agg[key]) { agg[key].lineup++; }
+        else { agg[key] = { date: dateStr, team, agent: agent.agentCode, email, reqId, calls: 0, minutes: 0, qualified: 0, lineup: 1, connected: 0 }; }
+      });
+
+      await sleep(300);
+    } catch (e) { console.warn(`[rebuildCache] Error on ${agent.agentCode}:`, e.message); }
+  }
+
+  // Write to _Dashboard_Cache
+  await ensureSheet(MAIN_SS_ID, DASH_CACHE_SHEET, DASH_CACHE_H, '#1a6fdc');
+  await clearRange(MAIN_SS_ID, `'${DASH_CACHE_SHEET}'!A2:Z`);
+  const now = new Date().toISOString();
+  const cacheRows = Object.values(agg).map(r => [
+    r.date, r.team, r.agent, r.email, r.reqId,
+    r.calls, Math.round(r.minutes * 100) / 100, r.qualified, r.lineup, now, r.connected,
+  ]);
+  if (cacheRows.length) await appendRows(MAIN_SS_ID, DASH_CACHE_SHEET, cacheRows);
+
+  const elapsed = Math.round((Date.now() - t0) / 1000);
+  console.log(`[rebuildCache] Done in ${elapsed}s — ${cacheRows.length} rows, ${deduped.length} agents`);
+  return { rowsWritten: cacheRows.length, agentsScanned: deduped.length, elapsed };
+}
+
 async function eodSweep() {
   if (pollRunning) {
     console.log('[eod] Poll running — will retry next trigger.');
@@ -2171,6 +2294,18 @@ async function startPoller() {
   // 9pm IST = 15:30 UTC — end of day sweep, all active campaigns fully updated
   cron.schedule('30 15 * * *', async () => {
     try { await eodSweep(); } catch (e) { console.error('[cron:eod]', e.message); }
+    // After EOD sweep finishes, rebuild dashboard cache so tomorrow's dashboard
+    // reflects today's completed data from all agent sheets
+    await sleep(120_000); // wait 2 min for eodSweep writes to settle
+    try {
+      console.log('[cron:eod] Triggering dashboard cache rebuild after EOD sweep…');
+      // Fire the rebuild via the server's forcerebuilddashboard action
+      const axios = require('axios');
+      const PORT  = process.env.PORT || 10000;
+      const { readSheet: _rs } = require('./sheets');
+      // Rebuild cache by reading all agents inline (avoids circular dependency)
+      await _rebuildDashboardCache();
+    } catch (e) { console.error('[cron:eod-cache]', e.message); }
   });
 
   console.log('[poller] All 11 jobs scheduled ✓');

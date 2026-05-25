@@ -1452,8 +1452,17 @@ async function handleGetDashboard(actor, body) {
   // (format: 'YYYY-MM-DD'). When present they override the preset range.
   const todayStr = istDateStr(); // 'YYYY-MM-DD' in IST
 
+  // selectedDates: Set of exact 'YYYY-MM-DD' strings when user picks specific dates
+  const selectedDates = Array.isArray(body.dates) && body.dates.length > 0
+    ? new Set(body.dates.map(d => String(d).trim()).filter(Boolean))
+    : null;
+
   let sinceDateStr, untilDateStr;
-  if (body.from) {
+  if (selectedDates) {
+    const sorted = [...selectedDates].sort();
+    sinceDateStr = sorted[0];
+    untilDateStr = sorted[sorted.length - 1];
+  } else if (body.from) {
     sinceDateStr = body.from;                        // custom start
     untilDateStr = body.to || todayStr;              // custom end (default today)
   } else if (range === 'today') {
@@ -1507,8 +1516,8 @@ async function handleGetDashboard(actor, body) {
 
         if (!dateStr || !agentCode) return;
 
-        // FIX: string comparison on 'YYYY-MM-DD' — avoids UTC/IST midnight mismatch
-        if (dateStr < sinceDateStr || dateStr > untilDateStr) return;
+        // FIX: support exact date set (custom date picker) OR range
+        if (selectedDates ? !selectedDates.has(dateStr) : (dateStr < sinceDateStr || dateStr > untilDateStr)) return;
 
         if (!visAgentCodes.has(agentCode)) return;
         if (actor.role !== 'super_admin' && !visEmails.has(triggeredBy)) return;
@@ -1576,7 +1585,7 @@ async function handleGetDashboard(actor, body) {
           const dv = r[si] || r[cai]; if (!dv) return;
           const d  = new Date(dv); if (isNaN(d.getTime())) return;
           const day = d.toLocaleDateString('en-CA', { timeZone: IST_TZ });
-          if (day < sinceDateStr || day > untilDateStr) return;
+          if (selectedDates ? !selectedDates.has(day) : (day < sinceDateStr || day > untilDateStr)) return;
 
           totalCalls++;
           const dur = Math.round(Number(r[di] || 0) * 100) / 100;
@@ -1751,7 +1760,7 @@ async function handleForceRebuildDashboard(actor) {
 
   const agents = (await getAllAgents()).filter(a => a.active && a.spreadsheetId);
   const users  = await getAllUsers();
-  users.forEach(u => { umap2[u.email.toLowerCase()] = u; });
+  users.forEach(u => { umap2[u.email.toLowerCase()] = u; }); // populate module-level map
 
   // Build trigger maps from Trigger Log
   const trigMap  = {}; // agentCode|reqId → email
@@ -1871,87 +1880,150 @@ async function handleForceRebuildDashboard(actor) {
 // Module-level umap for forceRebuild (populated lazily)
 const umap2 = {};
 
-async function handleGetUsage(actor) {
-  const users = await getAllUsers();
-  const vis   = new Set(visibleUserEmails(actor, users));
-  const ub    = {};
+async function handleGetUsage(actor, body = {}) {
+  const users  = await getAllUsers();
+  const vis    = new Set(visibleUserEmails(actor, users));
+  const ub     = {};
   users.forEach(u => { ub[u.email] = u; });
   const today   = istDateStr();
   const mtdFrom = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
 
-  // ── Fast path: read _Recruiter_Cache written by GAS every 15 min ──────────
+  // ── Parse date params (same logic as getDashboard) ────────────────────────
+  const selectedDates = Array.isArray(body.dates) && body.dates.length > 0
+    ? new Set(body.dates.map(d => String(d).trim()).filter(Boolean))
+    : null;
+  let sinceDateStr, untilDateStr;
+  if (selectedDates) {
+    const sorted = [...selectedDates].sort();
+    sinceDateStr = sorted[0]; untilDateStr = sorted[sorted.length - 1];
+  } else if (body.from) {
+    sinceDateStr = body.from; untilDateStr = body.to || today;
+  } else {
+    const range = body.range || '7d';
+    if (range === 'today') { sinceDateStr = untilDateStr = today; }
+    else {
+      const days = range === '30d' ? 30 : 7;
+      sinceDateStr = new Date(Date.now() - days * 86400_000).toLocaleDateString('en-CA', { timeZone: IST_TZ });
+      untilDateStr = today;
+    }
+  }
+  function inRange(dayStr) {
+    if (selectedDates) return selectedDates.has(dayStr);
+    return dayStr >= sinceDateStr && dayStr <= untilDateStr;
+  }
+
+  // ── STEP 1: Build call-count rows from Trigger Log (date-filtered) ─────────
+  const tlAgg = {}; // email → { calls, minutes }
   try {
-    const { headers: rh, rows: rr } = await readSheet(MAIN_SS_ID, '_Recruiter_Cache');
-    if (rh.length && rr.length) {
-      const gi = h => rh.indexOf(h);
-      const mbd = {}, mtu = {}, cbd = {}, ctu = {};
-
-      rr.forEach(r => {
-        const email = String(r[gi('Email')] || '').toLowerCase().trim();
-        if (!email || !vis.has(email)) return;
-        const dateStr = String(r[gi('Date')] || '');
-        const calls   = Number(r[gi('Calls')]   || 0);
-        const minutes = Number(r[gi('Minutes')] || 0);
-        const key = email + '|' + dateStr;
-        mbd[key] = (mbd[key] || 0) + minutes;
-        cbd[key] = (cbd[key] || 0) + calls;
-        const d = new Date(dateStr);
-        if (!isNaN(d.getTime()) && d >= mtdFrom) {
-          mtu[email] = (mtu[email] || 0) + minutes;
-          ctu[email] = (ctu[email] || 0) + calls;
-        }
+    const { headers: th, rows: tr } = await readSheet(MAIN_SS_ID, S.TLOG);
+    if (th.length) {
+      const ei = th.indexOf('User Email'), ti = th.indexOf('Timestamp');
+      const mi = th.indexOf('Estimated Minutes'), ci = th.indexOf('Contacts Count');
+      const mbd = {}, cbd = {};
+      tr.forEach(r => {
+        const em = String(r[ei] || '').toLowerCase().trim();
+        if (!em || !vis.has(em)) return;
+        const d = new Date(r[ti] || 0); if (isNaN(d.getTime())) return;
+        const day = d.toLocaleDateString('en-CA', { timeZone: IST_TZ });
+        if (!inRange(day)) return;
+        if (!tlAgg[em]) tlAgg[em] = { calls: 0, minutes: 0 };
+        tlAgg[em].calls   += Number(r[ci] || 0);
+        tlAgg[em].minutes += Number(r[mi] || 0);
       });
-
-      const recruiterMinutes = [...vis].map(em => {
-        const u = ub[em]; if (!u) return null;
-        const tm = mbd[em + '|' + today] || 0;
-        return {
-          email: em, name: u.name, team: u.team, role: u.role,
-          dailyLimit: u.dailyMinuteLimit,
-          todayMinutes: Math.round(tm * 100) / 100,
-          mtdMinutes:   Math.round((mtu[em] || 0) * 100) / 100,
-          todayCalls:   cbd[em + '|' + today] || 0,
-          mtdCalls:     ctu[em] || 0,
-          todayUsagePct: u.dailyMinuteLimit > 0 ? Math.round(tm / u.dailyMinuteLimit * 100) : 0,
-        };
-      }).filter(Boolean).filter(r => r.mtdMinutes > 0 || r.todayMinutes > 0);
-      recruiterMinutes.sort((a, b) => b.mtdMinutes - a.mtdMinutes);
-      return { ok: true, recruiterMinutes, _source: 'cache' };
     }
   } catch (_) {}
 
-  // ── Slow path: scan Trigger Log directly (fallback) ────────────────────────
+  const rows = [...vis].map(em => {
+    const u = ub[em]; if (!u) return null;
+    const t = tlAgg[em] || { calls: 0, minutes: 0 };
+    return { email: em, name: u.name, team: u.team, role: u.role,
+      dailyLimit: u.dailyMinuteLimit, calls: t.calls,
+      minutes: Math.round(t.minutes * 100) / 100 };
+  }).filter(Boolean).filter(r => r.calls > 0);
+
+  // ── STEP 2: Build leadStats by scanning Qualified_Leads per agent ───────────
+  // Returns the format the People tab expects:
+  // { email, name, team, totalLeads, connected, interviewLinedUp, cvAwaited, emptyCallStatus, fillRate }
+  const leadAgg = {}; // email → stats object
+  try {
+    const [allAgents] = await Promise.all([getAllAgents()]);
+    const visAgents = dedupeAgentsBySsId(agentsVisibleTo(actor, allAgents, users));
+    for (const a of visAgents) {
+      if (!a.spreadsheetId) continue;
+      try {
+        const { headers: qh, rows: qr } = await readSheet(a.spreadsheetId, AGT.QL);
+        if (!qh.length) continue;
+        const aei = qh.indexOf('Assigned To Email');
+        const dai = qh.indexOf('Date Added');
+        const fbi = qh.indexOf('Feedback');
+        const csi = qh.indexOf('Call Status');
+        const cvi = qh.indexOf('CV Link');
+        if (aei < 0) continue;
+        qr.forEach(r => {
+          // Date filter — only apply if Date Added exists
+          if (dai >= 0 && r[dai]) {
+            const d = new Date(r[dai]);
+            if (isNaN(d.getTime())) return;
+            const day = d.toLocaleDateString('en-CA', { timeZone: IST_TZ });
+            if (!inRange(day)) return;
+          }
+          const em = String(r[aei] || '').toLowerCase().trim();
+          if (!em || !vis.has(em)) return;
+          if (!leadAgg[em]) leadAgg[em] = { totalLeads: 0, connected: 0, interviewLinedUp: 0, cvAwaited: 0, emptyCallStatus: 0 };
+          leadAgg[em].totalLeads++;
+          const fb = String(fbi >= 0 ? r[fbi] || '' : '').toLowerCase();
+          if (_isInterviewLinedUp(fb)) leadAgg[em].interviewLinedUp++;
+          const cs = String(csi >= 0 ? r[csi] || '' : '').trim();
+          if (!cs) leadAgg[em].emptyCallStatus++;
+          const cv = String(cvi >= 0 ? r[cvi] || '' : '').trim();
+          if (!cv) leadAgg[em].cvAwaited++;
+        });
+      } catch (_) {}
+    }
+  } catch (_) {}
+
+  const leadStats = [...vis].map(em => {
+    const u = ub[em]; if (!u) return null;
+    const l = leadAgg[em] || { totalLeads: 0, connected: 0, interviewLinedUp: 0, cvAwaited: 0, emptyCallStatus: 0 };
+    const fillRate = l.totalLeads > 0 ? Math.round((l.totalLeads - l.emptyCallStatus) / l.totalLeads * 100) : 0;
+    return { email: em, name: u.name, team: u.team, ...l, fillRate };
+  }).filter(Boolean).filter(l => l.totalLeads > 0);
+
+  // ── STEP 3: Also build recruiterMinutes (MTD-style, for Minutes Tracking tab) ─
+  const mbd = {}, mtu = {}, cbd = {}, ctu = {};
   try {
     const { headers: th, rows: tr } = await readSheet(MAIN_SS_ID, S.TLOG);
-    if (!th.length) return { ok: true, recruiterMinutes: [] };
-    const ei = th.indexOf('User Email'); const ti = th.indexOf('Timestamp');
-    const mi = th.indexOf('Estimated Minutes'); const ci = th.indexOf('Contacts Count');
-    const mbd = {}, mtu = {}, cbd = {}, ctu = {};
-    tr.forEach(r => {
-      const em = String(r[ei] || '').toLowerCase().trim();
-      if (!em || !vis.has(em)) return;
-      const d = new Date(r[ti] || 0); if (isNaN(d.getTime())) return;
-      const day = d.toLocaleDateString('en-CA', { timeZone: IST_TZ });
-      const mins = Number(r[mi] || 0); const calls = Number(r[ci] || 0);
-      const dk = em + '|' + day;
-      mbd[dk] = (mbd[dk] || 0) + mins; cbd[dk] = (cbd[dk] || 0) + calls;
-      if (d >= mtdFrom) { mtu[em] = (mtu[em] || 0) + mins; ctu[em] = (ctu[em] || 0) + calls; }
-    });
-    const recruiterMinutes = [...vis].map(em => {
-      const u = ub[em]; if (!u) return null;
-      const tm = mbd[em + '|' + today] || 0;
-      return {
-        email: em, name: u.name, team: u.team, role: u.role,
-        dailyLimit: u.dailyMinuteLimit,
-        todayMinutes: Math.round(tm * 100) / 100,
-        mtdMinutes:   Math.round((mtu[em] || 0) * 100) / 100,
-        todayCalls:   cbd[em + '|' + today] || 0, mtdCalls: ctu[em] || 0,
-        todayUsagePct: u.dailyMinuteLimit > 0 ? Math.round(tm / u.dailyMinuteLimit * 100) : 0,
-      };
-    }).filter(Boolean).filter(r => r.mtdMinutes > 0 || r.todayMinutes > 0);
-    recruiterMinutes.sort((a, b) => b.mtdMinutes - a.mtdMinutes);
-    return { ok: true, recruiterMinutes, _source: 'full_scan' };
-  } catch (e) { return { ok: false, error: e.message }; }
+    if (th.length) {
+      const ei = th.indexOf('User Email'), ti = th.indexOf('Timestamp');
+      const mi = th.indexOf('Estimated Minutes'), ci = th.indexOf('Contacts Count');
+      tr.forEach(r => {
+        const em = String(r[ei] || '').toLowerCase().trim();
+        if (!em || !vis.has(em)) return;
+        const d = new Date(r[ti] || 0); if (isNaN(d.getTime())) return;
+        const day = d.toLocaleDateString('en-CA', { timeZone: IST_TZ });
+        const mins = Number(r[mi] || 0), calls = Number(r[ci] || 0);
+        const dk = em + '|' + day;
+        mbd[dk] = (mbd[dk] || 0) + mins; cbd[dk] = (cbd[dk] || 0) + calls;
+        if (d >= mtdFrom) { mtu[em] = (mtu[em] || 0) + mins; ctu[em] = (ctu[em] || 0) + calls; }
+      });
+    }
+  } catch (_) {}
+
+  const recruiterMinutes = [...vis].map(em => {
+    const u = ub[em]; if (!u) return null;
+    const tm = mbd[em + '|' + today] || 0;
+    return { email: em, name: u.name, team: u.team, role: u.role,
+      dailyLimit: u.dailyMinuteLimit,
+      todayMinutes:  Math.round(tm * 100) / 100,
+      mtdMinutes:    Math.round((mtu[em] || 0) * 100) / 100,
+      todayCalls:    cbd[em + '|' + today] || 0, mtdCalls: ctu[em] || 0,
+      todayUsagePct: u.dailyMinuteLimit > 0 ? Math.round(tm / u.dailyMinuteLimit * 100) : 0 };
+  }).filter(Boolean).filter(r => r.mtdMinutes > 0 || r.todayMinutes > 0);
+  recruiterMinutes.sort((a, b) => b.mtdMinutes - a.mtdMinutes);
+
+  return { ok: true, rows, leadStats, recruiterMinutes,
+    dateRange: { from: sinceDateStr, to: untilDateStr },
+    _source: 'full_scan' };
 }
 // ─── Manual Tracker ────────────────────────────────────────────────────────────
 async function handleGetManualTracker(actor, body) {
@@ -2392,7 +2464,8 @@ async function handleAction(body) {
     case 'assignlead':           return handleAssignLead(actor, body);
     case 'passtoqualifiedleads': return handlePassToQL(actor, body);
     case 'getdashboard':         return handleGetDashboard(actor, body);
-    case 'getusage':             return handleGetUsage(actor);
+    case 'getusage':             return handleGetUsage(actor, body);
+    case 'getminutestracking':   return handleGetUsage(actor, body); // alias — same data, Minutes Tracking tab
     case 'getcampaigns':         return handleGetCampaigns(actor, body);
     case 'getmastertracker':     return handleGetMasterTracker(actor, body);
     case 'getnotconnected':      return handleGetNotConnected(actor, body);
