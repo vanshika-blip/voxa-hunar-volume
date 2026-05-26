@@ -183,7 +183,7 @@ async function getAllAgents(force = false) {
   if (!headers.length) return (_agentsCache = []);
   const idx = h => headers.indexOf(h);
   _agentsCache = rows.map(r => {
-    let cv = [], rs = {}, qv = [], qr = [];
+    let cv = [], rs = {}, qv = [], qr = [], qev = [];
     try { cv = JSON.parse(r[idx('Custom Variables')] || '[]'); } catch (_) {}
     try { rs = JSON.parse(r[idx('Result Schema')]    || '{}'); } catch (_) {}
     try {
@@ -195,27 +195,33 @@ async function getAllAgents(force = false) {
       const raw = r[idx('Qualification Rules')];
       if (typeof raw === 'string' && raw.trim().startsWith('[')) qr = JSON.parse(raw);
     } catch (_) {}
+    try {
+      const raw = r[idx('Qualification Exclude Values')];
+      if (typeof raw === 'string' && raw.trim().startsWith('[')) qev = JSON.parse(raw);
+      else if (raw) qev = [String(raw)];
+    } catch (_) {}
     return {
-      agentCode:           String(r[idx('Agent Code')]           || '').trim(),
-      agentId:             String(r[idx('Agent ID')]             || '').trim(),
-      displayName:         String(r[idx('Display Name')]         || '').trim(),
-      description:         String(r[idx('Description')]          || '').trim(),
-      language:            String(r[idx('Language')]             || 'ENGLISH').trim(),
-      voicePersona:        String(r[idx('Voice Persona')]        || '').trim(),
-      customVariables:     Array.isArray(cv) ? cv : [],
-      resultSchema:        rs || {},
-      qualificationField:  String(r[idx('Qualification Field')]  || '').trim(),
-      qualificationValues: Array.isArray(qv) ? qv.filter(Boolean) : [],
-      qualificationRules:  Array.isArray(qr) ? qr : [],
-      estSecondsPerCall:   Number(r[idx('Est Seconds Per Call')] || 60),
-      active:              r[idx('Active')] === true || r[idx('Active')] === 'TRUE',
-      createdBy:           String(r[idx('Created By')]           || '').trim(),
-      clientName:          String(r[idx('Client Name')]          || '').trim(),
-      spreadsheetId:       String(r[idx('Spreadsheet ID')]       || '').trim(),
-      addedById:           r[idx('Added By ID')] === true || r[idx('Added By ID')] === 'TRUE',
-      agentPrompt:         String(r[idx('Agent Prompt')]         || '').trim(),
-      resultPrompt:        String(r[idx('Result Prompt')]        || '').trim(),
-      introduction:        String(r[idx('Introduction')]         || '').trim(),
+      agentCode:                  String(r[idx('Agent Code')]                  || '').trim(),
+      agentId:                    String(r[idx('Agent ID')]                    || '').trim(),
+      displayName:                String(r[idx('Display Name')]                || '').trim(),
+      description:                String(r[idx('Description')]                 || '').trim(),
+      language:                   String(r[idx('Language')]                    || 'ENGLISH').trim(),
+      voicePersona:               String(r[idx('Voice Persona')]               || '').trim(),
+      customVariables:            Array.isArray(cv) ? cv : [],
+      resultSchema:               rs || {},
+      qualificationField:         String(r[idx('Qualification Field')]         || '').trim(),
+      qualificationValues:        Array.isArray(qv)  ? qv.filter(Boolean)  : [],
+      qualificationExcludeValues: Array.isArray(qev) ? qev.filter(Boolean) : [],
+      qualificationRules:         Array.isArray(qr)  ? qr : [],
+      estSecondsPerCall:          Number(r[idx('Est Seconds Per Call')] || 60),
+      active:                     r[idx('Active')] === true || r[idx('Active')] === 'TRUE',
+      createdBy:                  String(r[idx('Created By')]   || '').trim(),
+      clientName:                 String(r[idx('Client Name')]  || '').trim(),
+      spreadsheetId:              String(r[idx('Spreadsheet ID')] || '').trim(),
+      addedById:                  r[idx('Added By ID')] === true || r[idx('Added By ID')] === 'TRUE',
+      agentPrompt:                String(r[idx('Agent Prompt')]  || '').trim(),
+      resultPrompt:               String(r[idx('Result Prompt')] || '').trim(),
+      introduction:               String(r[idx('Introduction')]  || '').trim(),
     };
   }).filter(a => a.agentCode);
   _agentsCacheAt = Date.now();
@@ -245,9 +251,10 @@ async function writeAgentRow(agent) {
       case 'Voice Persona':        return agent.voicePersona || '';
       case 'Custom Variables':     return JSON.stringify(agent.customVariables || []);
       case 'Result Schema':        return JSON.stringify(agent.resultSchema || {});
-      case 'Qualification Field':  return agent.qualificationField || '';
-      case 'Qualification Values': return JSON.stringify(agent.qualificationValues || []);
-      case 'Qualification Rules':  return JSON.stringify(agent.qualificationRules || []);
+      case 'Qualification Field':          return agent.qualificationField || '';
+      case 'Qualification Values':         return JSON.stringify(agent.qualificationValues || []);
+      case 'Qualification Exclude Values': return JSON.stringify(agent.qualificationExcludeValues || []);
+      case 'Qualification Rules':          return JSON.stringify(agent.qualificationRules || []);
       case 'Est Seconds Per Call': return Number(agent.estSecondsPerCall || 60);
       case 'Active':               return !!agent.active;
       case 'Last Synced':          return new Date().toISOString();
@@ -476,12 +483,16 @@ function isQualified(agent, result) {
       return kws.some(k => low.includes(String(k).toLowerCase()));
     });
   }
+  // Simple path: qualificationField + qualificationValues + qualificationExcludeValues
   if (!agent.qualificationField) return false;
   const val = result[agent.qualificationField];
   if (!val) return false;
+  const low = String(val).toLowerCase().trim();
+  // Exclude values checked first — any match = disqualified
+  const evs = agent.qualificationExcludeValues || [];
+  if (evs.length && evs.some(v => low.includes(String(v).toLowerCase().trim()))) return false;
   const vs = agent.qualificationValues || [];
   if (!vs.length) return !!val;
-  const low = String(val).toLowerCase().trim();
   return vs.some(v => low.includes(String(v).toLowerCase().trim()));
 }
 
@@ -548,8 +559,11 @@ function publicAgent(a) {
     agentCode: a.agentCode, agentId: a.agentId, displayName: a.displayName,
     description: a.description, language: a.language, voicePersona: a.voicePersona,
     customVariables: a.customVariables, resultSchema: a.resultSchema,
-    qualificationField: a.qualificationField, qualificationValues: a.qualificationValues || [],
-    qualificationRules: a.qualificationRules || [], estSecondsPerCall: a.estSecondsPerCall,
+    qualificationField:         a.qualificationField,
+    qualificationValues:        a.qualificationValues        || [],
+    qualificationExcludeValues: a.qualificationExcludeValues || [],
+    qualificationRules:         a.qualificationRules         || [],
+    estSecondsPerCall: a.estSecondsPerCall,
     active: a.active, createdBy: a.createdBy || '', addedById: !!a.addedById,
     agentPrompt: a.agentPrompt || '', resultPrompt: a.resultPrompt || '',
     introduction: a.introduction || '', clientName: a.clientName || '',
@@ -923,7 +937,7 @@ async function handleAddAgentById(actor, body) {
     language: d.language || 'ENGLISH', voicePersona: d.voice_persona || '',
     customVariables: d.custom_variables || [], resultSchema: d.result_schema || {},
     qualificationField: defaultQualField(d.result_schema), qualificationValues: [],
-    qualificationRules: [], estSecondsPerCall: 60, active: true,
+    qualificationExcludeValues: [], qualificationRules: [], estSecondsPerCall: 60, active: true,
     createdBy: actor.email, addedById: true, agentPrompt: '', resultPrompt: '',
     introduction: '', clientName: '', spreadsheetId: ssId,
   };
@@ -959,9 +973,10 @@ async function handleSyncAgents(actor, body) {
       description:         exist ? exist.description || d.summary || '' : d.summary || '',
       language:            d.language || 'ENGLISH', voicePersona: d.voice_persona || '',
       customVariables:     d.custom_variables || [], resultSchema: d.result_schema || {},
-      qualificationField:  exist ? exist.qualificationField : defaultQualField(d.result_schema),
-      qualificationValues: exist ? exist.qualificationValues || [] : [],
-      qualificationRules:  exist ? exist.qualificationRules  || [] : [],
+      qualificationField:         exist ? exist.qualificationField : defaultQualField(d.result_schema),
+      qualificationValues:        exist ? exist.qualificationValues        || [] : [],
+      qualificationExcludeValues: exist ? exist.qualificationExcludeValues || [] : [],
+      qualificationRules:         exist ? exist.qualificationRules         || [] : [],
       estSecondsPerCall:   exist ? exist.estSecondsPerCall : 60,
       active:              exist ? exist.active : false,
       createdBy:           exist ? exist.createdBy : actor.email,
@@ -1002,6 +1017,10 @@ async function handleUpsertAgent(actor, body) {
   let qValues = a.qualificationValues;
   if (typeof qValues === 'string') { try { qValues = JSON.parse(qValues); } catch (_) { qValues = []; } }
   if (Array.isArray(qValues)) merged.qualificationValues = qValues.filter(Boolean);
+
+  let qExclude = a.qualificationExcludeValues;
+  if (typeof qExclude === 'string') { try { qExclude = JSON.parse(qExclude); } catch (_) { qExclude = []; } }
+  if (Array.isArray(qExclude)) merged.qualificationExcludeValues = qExclude.filter(Boolean);
   if (!merged.spreadsheetId) {
     const ssId = await createSpreadsheet(`Voxa Agent: ${merged.agentCode}`);
     if (SERVICE_EMAIL) await shareSpreadsheet(ssId, SERVICE_EMAIL, actor.email);
@@ -2366,7 +2385,7 @@ async function handleSetupSheets(actor) {
   if (actor.role !== 'super_admin') return { ok: false, error: 'FORBIDDEN' };
   const USERS_H   = ['Email','Name','Role','Team','Daily Minute Limit','Active','Password Hash','Password Salt','Setup Token','Setup Token Expires','Created On','Created By'];
   const TEAMS_H   = ['Team ID','Team Name','Created On','Spreadsheet ID'];
-  const AGENTS_H  = ['Agent Code','Agent ID','Display Name','Description','Language','Voice Persona','Custom Variables','Result Schema','Qualification Field','Qualification Values','Qualification Rules','Est Seconds Per Call','Active','Last Synced','Created On','Created By','Added By ID','Agent Prompt','Result Prompt','Introduction','Client Name','Spreadsheet ID'];
+  const AGENTS_H  = ['Agent Code','Agent ID','Display Name','Description','Language','Voice Persona','Custom Variables','Result Schema','Qualification Field','Qualification Values','Qualification Exclude Values','Qualification Rules','Est Seconds Per Call','Active','Last Synced','Created On','Created By','Added By ID','Agent Prompt','Result Prompt','Introduction','Client Name','Spreadsheet ID'];
   const SESS_H    = ['Token','Email','Created At','Expires At'];
   const AUDIT_H   = ['Timestamp','Actor Email','Action','Target','Details'];
   const TLOG_H    = ['Timestamp','User Email','User Name','Team','Agent Code','Request ID','Contacts Count','Estimated Minutes'];

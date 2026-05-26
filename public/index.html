@@ -2378,6 +2378,8 @@ function AgentsView({ onChange, users }) {
                             <span className="t-mono" style={{fontSize:10,color:"var(--blue)"}}>{r.field}</span>
                             {r.keywords?.length>0 ? r.keywords.slice(0,3).map(k=><span key={k} className="t-pill t-pill-blue" style={{fontSize:8,marginLeft:3}}>~{k}</span>) : <span style={{color:"var(--muted)",fontSize:10}}> = any</span>}
                             {r.keywords?.length>3 && <span style={{fontSize:9,color:"var(--muted)"}}>+{r.keywords.length-3}</span>}
+                            {r.excludeKeywords?.length>0 && r.excludeKeywords.slice(0,2).map(k=><span key={k} style={{fontSize:8,marginLeft:3,background:"#fee2e2",color:"#991b1b",padding:"1px 4px",borderRadius:3}}>✗{k}</span>)}
+                            {r.excludeKeywords?.length>2 && <span style={{fontSize:9,color:"#dc2626"}}>+{r.excludeKeywords.length-2} excl</span>}
                           </div>
                         ))}
                       </td>
@@ -2406,30 +2408,38 @@ function AgentEditModal({ agent, onSave, onClose }) {
   const [qualRules, setQualRules] = useState(() => {
     const rules = {};
     if (agent.qualificationRules && Array.isArray(agent.qualificationRules) && agent.qualificationRules.length) {
-      agent.qualificationRules.forEach(r => { if(r.field) rules[r.field] = r.keywords || []; });
+      agent.qualificationRules.forEach(r => { if(r.field) rules[r.field] = { keywords: r.keywords||[], excludeKeywords: r.excludeKeywords||[] }; });
     } else if (agent.qualificationField) {
       const kws = agent.qualificationValues?.length ? [...agent.qualificationValues] : agent.qualificationValue ? [agent.qualificationValue] : [];
-      rules[agent.qualificationField] = kws;
+      rules[agent.qualificationField] = { keywords: kws, excludeKeywords: [] };
     }
     return rules;
   });
   const [kwInputs, setKwInputs] = useState({});
+  const [exInputs, setExInputs] = useState({});
   const resultFields = useMemo(() => {
     const s = agent.resultSchema || {};
     if (s.properties) return Object.keys(s.properties);
     return Object.keys(s).filter(k => k !== "type" && k !== "required");
   }, [agent.resultSchema]);
   const selectedFields = Object.keys(qualRules);
-  function toggleField(field) { setQualRules(prev => { const next = {...prev}; if (next[field] !== undefined) { delete next[field]; } else { next[field] = []; } return next; }); }
+  function toggleField(field) { setQualRules(prev => { const next = {...prev}; if (next[field] !== undefined) { delete next[field]; } else { next[field] = {keywords:[],excludeKeywords:[]}; } return next; }); }
   function addKeyword(field) {
     const kw = (kwInputs[field] || "").trim();
     if (!kw) return;
-    setQualRules(prev => { const existing = prev[field] || []; if (existing.map(k=>k.toLowerCase()).includes(kw.toLowerCase())) return prev; return {...prev, [field]: [...existing, kw]}; });
+    setQualRules(prev => { const existing = prev[field]?.keywords||[]; if (existing.map(k=>k.toLowerCase()).includes(kw.toLowerCase())) return prev; return {...prev, [field]: {...(prev[field]||{keywords:[],excludeKeywords:[]}), keywords: [...existing, kw]}}; });
     setKwInputs(prev => ({...prev, [field]: ""}));
   }
-  function removeKeyword(field, kw) { setQualRules(prev => ({...prev, [field]: (prev[field]||[]).filter(k=>k!==kw)})); }
+  function removeKeyword(field, kw) { setQualRules(prev => ({...prev, [field]: {...prev[field], keywords:(prev[field]?.keywords||[]).filter(k=>k!==kw)}})); }
+  function addExKeyword(field) {
+    const kw = (exInputs[field] || "").trim();
+    if (!kw) return;
+    setQualRules(prev => { const existing = prev[field]?.excludeKeywords||[]; if (existing.map(k=>k.toLowerCase()).includes(kw.toLowerCase())) return prev; return {...prev, [field]: {...(prev[field]||{keywords:[],excludeKeywords:[]}), excludeKeywords: [...existing, kw]}}; });
+    setExInputs(prev => ({...prev, [field]: ""}));
+  }
+  function removeExKeyword(field, kw) { setQualRules(prev => ({...prev, [field]: {...prev[field], excludeKeywords:(prev[field]?.excludeKeywords||[]).filter(k=>k!==kw)}})); }
   function doSave() {
-    const rules = Object.entries(qualRules).filter(([f]) => f).map(([field, keywords]) => ({field, keywords}));
+    const rules = Object.entries(qualRules).filter(([f]) => f).map(([field, v]) => ({field, keywords: v.keywords||[], excludeKeywords: v.excludeKeywords||[]}));
     const firstField = rules[0]?.field || "";
     const allKeywords = rules.flatMap(r => r.keywords);
     onSave({...a, qualificationRules: rules, qualificationField: firstField, qualificationValues: allKeywords, qualificationValue: allKeywords[0] || ""});
@@ -2463,14 +2473,22 @@ function AgentEditModal({ agent, onSave, onClose }) {
               </div>
             )}
             {selectedFields.map(field=>{
-              const keywords = qualRules[field]||[];
+              const keywords = qualRules[field]?.keywords||[];
+              const exKeywords = qualRules[field]?.excludeKeywords||[];
               return (
                 <div key={field} style={{border:"1.5px solid #0066b3",padding:"8px 10px",marginBottom:8}}>
                   <div style={{fontFamily:"var(--fm)",fontSize:11,fontWeight:700,color:"var(--blue)",marginBottom:6}}>{field}</div>
-                  <div style={{display:"flex",flexWrap:"wrap",gap:3,marginBottom:6}}>{keywords.map(kw=><span key={kw} className="t-kwtag">~{kw}<button className="t-kwtag-rm" onClick={()=>removeKeyword(field,kw)}>×</button></span>)}</div>
-                  <div style={{display:"flex",gap:6}}>
-                    <input className="t-input" style={{flex:1,fontSize:11,padding:"5px 8px"}} value={kwInputs[field]||""} onChange={e=>setKwInputs(prev=>({...prev,[field]:e.target.value}))} onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();addKeyword(field);}}} placeholder="Add keyword…"/>
+                  <div style={{fontSize:9,fontFamily:"var(--fd)",fontWeight:700,color:"#059669",letterSpacing:".1em",marginBottom:3}}>INCLUDE — any match qualifies</div>
+                  <div style={{display:"flex",flexWrap:"wrap",gap:3,marginBottom:5}}>{keywords.map(kw=><span key={kw} className="t-kwtag">~{kw}<button className="t-kwtag-rm" onClick={()=>removeKeyword(field,kw)}>×</button></span>)}{keywords.length===0&&<span style={{fontSize:10,color:"var(--muted)",fontStyle:"italic"}}>Any non-empty value qualifies</span>}</div>
+                  <div style={{display:"flex",gap:6,marginBottom:8}}>
+                    <input className="t-input" style={{flex:1,fontSize:11,padding:"5px 8px"}} value={kwInputs[field]||""} onChange={e=>setKwInputs(prev=>({...prev,[field]:e.target.value}))} onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();addKeyword(field);}}} placeholder="Add include keyword…"/>
                     <button className="t-btn t-btn-black t-btn-sm" onClick={()=>addKeyword(field)}>+ Add</button>
+                  </div>
+                  <div style={{fontSize:9,fontFamily:"var(--fd)",fontWeight:700,color:"#dc2626",letterSpacing:".1em",marginBottom:3}}>EXCLUDE — any match disqualifies</div>
+                  <div style={{display:"flex",flexWrap:"wrap",gap:3,marginBottom:5}}>{exKeywords.map(kw=><span key={kw} style={{display:"inline-flex",alignItems:"center",gap:3,background:"#fee2e2",color:"#991b1b",padding:"2px 7px",fontSize:10,fontFamily:"var(--fm)"}}>✗{kw}<button style={{background:"none",border:"none",cursor:"pointer",color:"#991b1b",fontSize:12,padding:"0 0 0 2px",lineHeight:1}} onClick={()=>removeExKeyword(field,kw)}>×</button></span>)}{exKeywords.length===0&&<span style={{fontSize:10,color:"var(--muted)",fontStyle:"italic"}}>No exclusions</span>}</div>
+                  <div style={{display:"flex",gap:6}}>
+                    <input className="t-input" style={{flex:1,fontSize:11,padding:"5px 8px",borderColor:"#fca5a5"}} value={exInputs[field]||""} onChange={e=>setExInputs(prev=>({...prev,[field]:e.target.value}))} onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();addExKeyword(field);}}} placeholder="Add exclude keyword… (e.g. not eligible)"/>
+                    <button className="t-btn t-btn-sm" style={{background:"#fee2e2",color:"#991b1b",border:"1.5px solid #fca5a5",padding:"4px 10px",fontSize:11,fontFamily:"var(--fd)",fontWeight:700,cursor:"pointer"}} onClick={()=>addExKeyword(field)}>✗ Add</button>
                   </div>
                 </div>
               );
@@ -2723,7 +2741,7 @@ const [addedAgentForQual, setAddedAgentForQual] = useState(null);
 
   async function doSave(form, qualRules) {
     setSaving(true); setMsg({type:"",text:""});
-    const rules = Object.entries(qualRules).filter(([f])=>f).map(([field,keywords])=>({field,keywords}));
+    const rules = Object.entries(qualRules).filter(([f])=>f).map(([field,v])=>({field,keywords:v.keywords||[],excludeKeywords:v.excludeKeywords||[]}));
     const firstField = rules[0]?.field||"";
     const allKeywords = rules.flatMap(r=>r.keywords);
     const resultSchema = {};
@@ -2894,21 +2912,24 @@ function TLQualEditor({ agent, onBack, onSaved }) {
 
   const [qualRules, setQualRules] = useState(()=>{
     const rules={};
-    if(agent?.qualificationRules?.length){ agent.qualificationRules.forEach(r=>{ if(r.field) rules[r.field]=r.keywords||[]; }); }
-    else if(agent?.qualificationField){ rules[agent.qualificationField]=agent.qualificationValues||[]; }
+    if(agent?.qualificationRules?.length){ agent.qualificationRules.forEach(r=>{ if(r.field) rules[r.field]={keywords:r.keywords||[],excludeKeywords:r.excludeKeywords||[]}; }); }
+    else if(agent?.qualificationField){ rules[agent.qualificationField]={keywords:agent.qualificationValues||[],excludeKeywords:[]}; }
     return rules;
   });
   const [kwInputs,setKwInputs]=useState({});
+  const [exInputs,setExInputs]=useState({});
   const [saving,setSaving]=useState(false);
   const [msg,setMsg]=useState({type:"",text:""});
 
-  function toggleField(f){ setQualRules(p=>{ const n={...p}; if(n[f]!==undefined)delete n[f]; else n[f]=[]; return n; }); }
-  function addKw(f){ const kw=(kwInputs[f]||"").trim(); if(!kw)return; setQualRules(p=>({...p,[f]:[...(p[f]||[]),kw]})); setKwInputs(p=>({...p,[f]:""})); }
-  function removeKw(f,kw){ setQualRules(p=>({...p,[f]:(p[f]||[]).filter(k=>k!==kw)})); }
+  function toggleField(f){ setQualRules(p=>{ const n={...p}; if(n[f]!==undefined)delete n[f]; else n[f]={keywords:[],excludeKeywords:[]}; return n; }); }
+  function addKw(f){ const kw=(kwInputs[f]||"").trim(); if(!kw)return; setQualRules(p=>({...p,[f]:{...(p[f]||{keywords:[],excludeKeywords:[]}),keywords:[...(p[f]?.keywords||[]),kw]}})); setKwInputs(p=>({...p,[f]:""})); }
+  function removeKw(f,kw){ setQualRules(p=>({...p,[f]:{...p[f],keywords:(p[f]?.keywords||[]).filter(k=>k!==kw)}})); }
+  function addExKw(f){ const kw=(exInputs[f]||"").trim(); if(!kw)return; setQualRules(p=>({...p,[f]:{...(p[f]||{keywords:[],excludeKeywords:[]}),excludeKeywords:[...(p[f]?.excludeKeywords||[]),kw]}})); setExInputs(p=>({...p,[f]:""})); }
+  function removeExKw(f,kw){ setQualRules(p=>({...p,[f]:{...p[f],excludeKeywords:(p[f]?.excludeKeywords||[]).filter(k=>k!==kw)}})); }
 
   async function save(){
     setSaving(true); setMsg({type:"",text:""});
-    const rules=Object.entries(qualRules).filter(([f])=>f).map(([field,keywords])=>({field,keywords}));
+    const rules=Object.entries(qualRules).filter(([f])=>f).map(([field,v])=>({field,keywords:v.keywords||[],excludeKeywords:v.excludeKeywords||[]}));
     const r=await api("upsertMyAgent",{agent:{agentCode:agent.agentCode,agentId:agent.agentId,qualificationRules:rules,qualificationField:rules[0]?.field||"",qualificationValues:rules.flatMap(r=>r.keywords),qualificationValue:rules.flatMap(r=>r.keywords)[0]||""}});
     setSaving(false);
     if(!r.ok){ setMsg({type:"error",text:r.message||r.error}); return; }
@@ -2942,17 +2963,28 @@ setMsg({type:"success",text:"Rules saved!"}); setTimeout(onSaved,900);
                 </div>
               </div>
               {Object.keys(qualRules).map(field=>{
-                const kws=qualRules[field]||[];
+                const kws=qualRules[field]?.keywords||[];
+                const exKws=qualRules[field]?.excludeKeywords||[];
                 return (
                   <div key={field} style={{border:"1.5px solid #0066b3",padding:"12px 14px",marginBottom:12,background:"#f0f8ff"}}>
-                    <div style={{fontFamily:"var(--fm)",fontSize:13,fontWeight:700,color:"var(--blue)",marginBottom:6}}>{field}</div>
-                    <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:8}}>
+                    <div style={{fontFamily:"var(--fm)",fontSize:13,fontWeight:700,color:"var(--blue)",marginBottom:8}}>{field}</div>
+                    <div style={{fontSize:9,fontFamily:"var(--fd)",fontWeight:700,color:"#059669",letterSpacing:".1em",marginBottom:3}}>INCLUDE — any match qualifies</div>
+                    <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:6}}>
                       {kws.map(kw=><span key={kw} className="t-kwtag">~{kw}<button className="t-kwtag-rm" onClick={()=>removeKw(field,kw)}>×</button></span>)}
                       {kws.length===0 && <span style={{fontSize:11,color:"var(--muted)",fontStyle:"italic"}}>Any non-empty value qualifies</span>}
                     </div>
-                    <div style={{display:"flex",gap:6}}>
-                      <input className="t-input" style={{flex:1,fontSize:12,padding:"6px 10px"}} value={kwInputs[field]||""} placeholder="Add keyword…" onChange={e=>setKwInputs(p=>({...p,[field]:e.target.value}))} onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();addKw(field);}}}/>
+                    <div style={{display:"flex",gap:6,marginBottom:10}}>
+                      <input className="t-input" style={{flex:1,fontSize:12,padding:"6px 10px"}} value={kwInputs[field]||""} placeholder="Add include keyword…" onChange={e=>setKwInputs(p=>({...p,[field]:e.target.value}))} onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();addKw(field);}}}/>
                       <button className="t-btn t-btn-black t-btn-sm" onClick={()=>addKw(field)}>+ Add</button>
+                    </div>
+                    <div style={{fontSize:9,fontFamily:"var(--fd)",fontWeight:700,color:"#dc2626",letterSpacing:".1em",marginBottom:3}}>EXCLUDE — any match disqualifies</div>
+                    <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:6}}>
+                      {exKws.map(kw=><span key={kw} style={{display:"inline-flex",alignItems:"center",gap:3,background:"#fee2e2",color:"#991b1b",padding:"3px 8px",fontSize:11,fontFamily:"var(--fm)"}}>✗{kw}<button style={{background:"none",border:"none",cursor:"pointer",color:"#991b1b",fontSize:13,padding:"0 0 0 2px",lineHeight:1}} onClick={()=>removeExKw(field,kw)}>×</button></span>)}
+                      {exKws.length===0 && <span style={{fontSize:11,color:"var(--muted)",fontStyle:"italic"}}>No exclusions</span>}
+                    </div>
+                    <div style={{display:"flex",gap:6}}>
+                      <input className="t-input" style={{flex:1,fontSize:12,padding:"6px 10px",borderColor:"#fca5a5"}} value={exInputs[field]||""} placeholder="Add exclude keyword… (e.g. not eligible)" onChange={e=>setExInputs(p=>({...p,[field]:e.target.value}))} onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();addExKw(field);}}}/>
+                      <button className="t-btn t-btn-sm" style={{background:"#fee2e2",color:"#991b1b",border:"1.5px solid #fca5a5",padding:"5px 12px",fontSize:12,fontFamily:"var(--fd)",fontWeight:700,cursor:"pointer"}} onClick={()=>addExKw(field)}>✗ Add</button>
                     </div>
                   </div>
                 );
@@ -2986,14 +3018,17 @@ function TLAddByIdView({ onBack, onAdd, saving, msg, addedAgent }) {
     return Object.keys(s).filter(k=>k!=="type"&&k!=="required");
   },[addedAgent]);
 
-  function toggleQF(f){ setQualRules(p=>{ const n={...p}; if(n[f]!==undefined)delete n[f]; else n[f]=[]; return n; }); }
-  function addKw(f){ const kw=(kwInputs[f]||"").trim(); if(!kw)return; setQualRules(p=>({...p,[f]:[...(p[f]||[]),kw]})); setKwInputs(p=>({...p,[f]:""})); }
-  function rmKw(f,kw){ setQualRules(p=>({...p,[f]:(p[f]||[]).filter(k=>k!==kw)})); }
+  function toggleQF(f){ setQualRules(p=>{ const n={...p}; if(n[f]!==undefined)delete n[f]; else n[f]={keywords:[],excludeKeywords:[]}; return n; }); }
+  function addKw(f){ const kw=(kwInputs[f]||"").trim(); if(!kw)return; setQualRules(p=>({...p,[f]:{...(p[f]||{keywords:[],excludeKeywords:[]}),keywords:[...(p[f]?.keywords||[]),kw]}})); setKwInputs(p=>({...p,[f]:""})); }
+  function rmKw(f,kw){ setQualRules(p=>({...p,[f]:{...p[f],keywords:(p[f]?.keywords||[]).filter(k=>k!==kw)}})); }
+  const [exInputs, setExInputs] = useState({});
+  function addExKwById(f){ const kw=(exInputs[f]||"").trim(); if(!kw)return; setQualRules(p=>({...p,[f]:{...(p[f]||{keywords:[],excludeKeywords:[]}),excludeKeywords:[...(p[f]?.excludeKeywords||[]),kw]}})); setExInputs(p=>({...p,[f]:""})); }
+  function rmExKwById(f,kw){ setQualRules(p=>({...p,[f]:{...p[f],excludeKeywords:(p[f]?.excludeKeywords||[]).filter(k=>k!==kw)}})); }
 
   async function saveQualRules(){
     if(!addedAgent) return;
     setSavingQual(true); setQualMsg({type:"",text:""});
-    const rules = Object.entries(qualRules).filter(([f])=>f).map(([field,keywords])=>({field,keywords}));
+    const rules = Object.entries(qualRules).filter(([f])=>f).map(([field,v])=>({field,keywords:v.keywords||[],excludeKeywords:v.excludeKeywords||[]}));
     const r = await api("upsertMyAgent",{agent:{agentCode:addedAgent.agentCode,agentId:addedAgent.agentId,qualificationRules:rules,qualificationField:rules[0]?.field||"",qualificationValues:rules.flatMap(r=>r.keywords),qualificationValue:rules.flatMap(r=>r.keywords)[0]||""}});
     setSavingQual(false);
     if(!r.ok){ setQualMsg({type:"error",text:r.message||r.error}); return; }
@@ -3057,17 +3092,28 @@ function TLAddByIdView({ onBack, onAdd, saving, msg, addedAgent }) {
                 })}
               </div>
               {Object.keys(qualRules).map(field=>{
-                const kws=qualRules[field]||[];
+                const kws=qualRules[field]?.keywords||[];
+                const exKws=qualRules[field]?.excludeKeywords||[];
                 return (
                   <div key={field} style={{border:"1.5px solid #0066b3",padding:"11px 13px",marginBottom:10,background:"#f0f8ff"}}>
                     <div style={{fontFamily:"var(--fm)",fontSize:12,fontWeight:700,color:"var(--blue)",marginBottom:6}}>{field}</div>
-                    <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:7}}>
+                    <div style={{fontSize:9,fontFamily:"var(--fd)",fontWeight:700,color:"#059669",letterSpacing:".1em",marginBottom:3}}>INCLUDE — any match qualifies</div>
+                    <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:5}}>
                       {kws.map(kw=><span key={kw} className="t-kwtag">~{kw}<button className="t-kwtag-rm" onClick={()=>rmKw(field,kw)}>×</button></span>)}
                       {kws.length===0&&<span style={{fontSize:10,color:"var(--muted)",fontStyle:"italic"}}>Any non-empty value qualifies</span>}
                     </div>
-                    <div style={{display:"flex",gap:6}}>
-                      <input className="t-input" style={{flex:1,fontSize:11,padding:"5px 8px"}} value={kwInputs[field]||""} placeholder="Add keyword (e.g. yes, interested)…" onChange={e=>setKwInputs(p=>({...p,[field]:e.target.value}))} onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();addKw(field);}}}/>
+                    <div style={{display:"flex",gap:6,marginBottom:8}}>
+                      <input className="t-input" style={{flex:1,fontSize:11,padding:"5px 8px"}} value={kwInputs[field]||""} placeholder="Add include keyword (e.g. yes, interested)…" onChange={e=>setKwInputs(p=>({...p,[field]:e.target.value}))} onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();addKw(field);}}}/>
                       <button className="t-btn t-btn-black t-btn-sm" onClick={()=>addKw(field)}>+ Add</button>
+                    </div>
+                    <div style={{fontSize:9,fontFamily:"var(--fd)",fontWeight:700,color:"#dc2626",letterSpacing:".1em",marginBottom:3}}>EXCLUDE — any match disqualifies</div>
+                    <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:5}}>
+                      {exKws.map(kw=><span key={kw} style={{display:"inline-flex",alignItems:"center",gap:3,background:"#fee2e2",color:"#991b1b",padding:"2px 7px",fontSize:10,fontFamily:"var(--fm)"}}>✗{kw}<button style={{background:"none",border:"none",cursor:"pointer",color:"#991b1b",fontSize:12,padding:"0 0 0 2px",lineHeight:1}} onClick={()=>rmExKwById(field,kw)}>×</button></span>)}
+                      {exKws.length===0&&<span style={{fontSize:10,color:"var(--muted)",fontStyle:"italic"}}>No exclusions</span>}
+                    </div>
+                    <div style={{display:"flex",gap:6}}>
+                      <input className="t-input" style={{flex:1,fontSize:11,padding:"5px 8px",borderColor:"#fca5a5"}} value={exInputs[field]||""} placeholder="Add exclude keyword… (e.g. not eligible)" onChange={e=>setExInputs(p=>({...p,[field]:e.target.value}))} onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();addExKwById(field);}}}/>
+                      <button className="t-btn t-btn-sm" style={{background:"#fee2e2",color:"#991b1b",border:"1.5px solid #fca5a5",padding:"4px 10px",fontSize:11,fontFamily:"var(--fd)",fontWeight:700,cursor:"pointer"}} onClick={()=>addExKwById(field)}>✗ Add</button>
                     </div>
                   </div>
                 );
@@ -3106,16 +3152,19 @@ function TLAgentWizard({ user, editAgent, onSave, onBack, saving, msg, setMsg })
   const initQR = ()=>{
     if(!editAgent) return {};
     const rules={};
-    if(editAgent.qualificationRules?.length){ editAgent.qualificationRules.forEach(r=>{ if(r.field) rules[r.field]=r.keywords||[]; }); }
-    else if(editAgent.qualificationField){ rules[editAgent.qualificationField]=editAgent.qualificationValues||[]; }
+    if(editAgent.qualificationRules?.length){ editAgent.qualificationRules.forEach(r=>{ if(r.field) rules[r.field]={keywords:r.keywords||[],excludeKeywords:r.excludeKeywords||[]}; }); }
+    else if(editAgent.qualificationField){ rules[editAgent.qualificationField]={keywords:editAgent.qualificationValues||[],excludeKeywords:[]}; }
     return rules;
   };
   const [qualRules,setQualRules]=useState(initQR);
   const [kwInputs,setKwInputs]=useState({});
+  const [exInputs,setExInputs]=useState({});
 
-  function toggleQF(f){ setQualRules(p=>{ const n={...p}; if(n[f]!==undefined)delete n[f]; else n[f]=[]; return n; }); }
-  function addKw2(f){ const kw=(kwInputs[f]||"").trim(); if(!kw)return; setQualRules(p=>({...p,[f]:[...(p[f]||[]),kw]})); setKwInputs(p=>({...p,[f]:""})); }
-  function rmKw(f,kw){ setQualRules(p=>({...p,[f]:(p[f]||[]).filter(k=>k!==kw)})); }
+  function toggleQF(f){ setQualRules(p=>{ const n={...p}; if(n[f]!==undefined)delete n[f]; else n[f]={keywords:[],excludeKeywords:[]}; return n; }); }
+  function addKw2(f){ const kw=(kwInputs[f]||"").trim(); if(!kw)return; setQualRules(p=>({...p,[f]:{...(p[f]||{keywords:[],excludeKeywords:[]}),keywords:[...(p[f]?.keywords||[]),kw]}})); setKwInputs(p=>({...p,[f]:""})); }
+  function rmKw(f,kw){ setQualRules(p=>({...p,[f]:{...p[f],keywords:(p[f]?.keywords||[]).filter(k=>k!==kw)}})); }
+  function addExKw2(f){ const kw=(exInputs[f]||"").trim(); if(!kw)return; setQualRules(p=>({...p,[f]:{...(p[f]||{keywords:[],excludeKeywords:[]}),excludeKeywords:[...(p[f]?.excludeKeywords||[]),kw]}})); setExInputs(p=>({...p,[f]:""})); }
+  function rmExKw(f,kw){ setQualRules(p=>({...p,[f]:{...p[f],excludeKeywords:(p[f]?.excludeKeywords||[]).filter(k=>k!==kw)}})); }
   function addRF(){ setForm(f=>({...f,resultFields:[...f.resultFields,{name:"",expected:""}]})); }
   function updateRF(i,k,v){ setForm(f=>{ const rf=[...f.resultFields]; rf[i]={...rf[i],[k]:v}; return{...f,resultFields:rf}; }); }
   function removeRF(i){ setForm(f=>({...f,resultFields:f.resultFields.filter((_,j)=>j!==i)})); }
@@ -3130,7 +3179,7 @@ function TLAgentWizard({ user, editAgent, onSave, onBack, saving, msg, setMsg })
         <div style={{fontSize:11,color:"var(--muted)",marginBottom:8}}><b>Language:</b> {form.language||"—"}</div>
         <div style={{fontSize:11,color:"var(--muted)",marginBottom:8}}><b>Persona:</b> <span style={{display:"inline-flex",alignItems:"center",gap:4,background:"#efefef",padding:"2px 8px",borderRadius:4,fontWeight:700}}>{form.voicePersona||"—"} ▷</span></div>
         {definedFields.length>0 && <div style={{marginTop:10}}><div style={{fontFamily:"var(--fd)",fontWeight:700,fontSize:9,color:"var(--muted)",letterSpacing:".12em",marginBottom:4}}>RESULT FIELDS</div>{definedFields.map(f=><div key={f} style={{fontFamily:"var(--fm)",fontSize:10,color:"#1a6fdc",marginBottom:2}}>{f}</div>)}</div>}
-        {Object.keys(qualRules).length>0 && <div style={{marginTop:10}}><div style={{fontFamily:"var(--fd)",fontWeight:700,fontSize:9,color:"var(--muted)",letterSpacing:".12em",marginBottom:4}}>QUAL RULES</div>{Object.entries(qualRules).map(([f,kws])=><div key={f} style={{fontSize:10,marginBottom:2}}><span style={{color:"var(--blue)",fontWeight:700}}>{f}</span>{kws.length>0&&kws.map(kw=><span key={kw} style={{fontSize:8,background:"#dbeafe",color:"#1e40af",padding:"1px 4px",borderRadius:2,marginLeft:3}}>{kw}</span>)}</div>)}</div>}
+        {Object.keys(qualRules).length>0 && <div style={{marginTop:10}}><div style={{fontFamily:"var(--fd)",fontWeight:700,fontSize:9,color:"var(--muted)",letterSpacing:".12em",marginBottom:4}}>QUAL RULES</div>{Object.entries(qualRules).map(([f,v])=><div key={f} style={{fontSize:10,marginBottom:3}}><span style={{color:"var(--blue)",fontWeight:700}}>{f}</span>{(v.keywords||[]).map(kw=><span key={kw} style={{fontSize:8,background:"#dbeafe",color:"#1e40af",padding:"1px 4px",borderRadius:2,marginLeft:3}}>~{kw}</span>)}{(v.excludeKeywords||[]).map(kw=><span key={kw} style={{fontSize:8,background:"#fee2e2",color:"#991b1b",padding:"1px 4px",borderRadius:2,marginLeft:3}}>✗{kw}</span>)}</div>)}</div>}
         <div style={{marginTop:14}}><div style={{fontFamily:"var(--fd)",fontWeight:700,fontSize:9,color:"var(--muted)",letterSpacing:".12em",marginBottom:4}}>PRESET VARS</div>{["{greeting}","{persona_name}","{callee_name}","{mobile_number}"].map(v=><div key={v} style={{fontFamily:"var(--fm)",fontSize:10,color:"#6739b7",marginBottom:1}}>{v}</div>)}</div>
       </div>
     );
@@ -3234,15 +3283,23 @@ function TLAgentWizard({ user, editAgent, onSave, onBack, saving, msg, setMsg })
                       })}
                     </div>
                     {Object.keys(qualRules).map(field=>{
-                      const kws=qualRules[field]||[];
+                      const kws=qualRules[field]?.keywords||[];
+                      const exKws=qualRules[field]?.excludeKeywords||[];
                       return (
                         <div key={field} style={{border:"1.5px solid #0066b3",padding:"11px 13px",marginBottom:10,background:"#f0f8ff"}}>
                           <div style={{fontFamily:"var(--fm)",fontSize:12,fontWeight:700,color:"var(--blue)",marginBottom:6}}>{field}</div>
-                          <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:7}}>
+                          <div style={{fontSize:9,fontFamily:"var(--fd)",fontWeight:700,color:"#059669",letterSpacing:".1em",marginBottom:3}}>INCLUDE — any match qualifies</div>
+                          <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:5}}>
                             {kws.map(kw=><span key={kw} className="t-kwtag">~{kw}<button className="t-kwtag-rm" onClick={()=>rmKw(field,kw)}>×</button></span>)}
                             {kws.length===0&&<span style={{fontSize:10,color:"var(--muted)",fontStyle:"italic"}}>Any non-empty value qualifies</span>}
                           </div>
-                          <div style={{display:"flex",gap:6}}><input className="t-input" style={{flex:1,fontSize:11,padding:"5px 8px"}} value={kwInputs[field]||""} placeholder="Add keyword (e.g. yes, interested)…" onChange={e=>setKwInputs(p=>({...p,[field]:e.target.value}))} onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();addKw2(field);}}}/><button className="t-btn t-btn-black t-btn-sm" onClick={()=>addKw2(field)}>+ Add</button></div>
+                          <div style={{display:"flex",gap:6,marginBottom:8}}><input className="t-input" style={{flex:1,fontSize:11,padding:"5px 8px"}} value={kwInputs[field]||""} placeholder="Add include keyword (e.g. yes, interested)…" onChange={e=>setKwInputs(p=>({...p,[field]:e.target.value}))} onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();addKw2(field);}}}/><button className="t-btn t-btn-black t-btn-sm" onClick={()=>addKw2(field)}>+ Add</button></div>
+                          <div style={{fontSize:9,fontFamily:"var(--fd)",fontWeight:700,color:"#dc2626",letterSpacing:".1em",marginBottom:3}}>EXCLUDE — any match disqualifies</div>
+                          <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:5}}>
+                            {exKws.map(kw=><span key={kw} style={{display:"inline-flex",alignItems:"center",gap:3,background:"#fee2e2",color:"#991b1b",padding:"2px 7px",fontSize:10,fontFamily:"var(--fm)"}}>✗{kw}<button style={{background:"none",border:"none",cursor:"pointer",color:"#991b1b",fontSize:12,padding:"0 0 0 2px",lineHeight:1}} onClick={()=>rmExKw(field,kw)}>×</button></span>)}
+                            {exKws.length===0&&<span style={{fontSize:10,color:"var(--muted)",fontStyle:"italic"}}>No exclusions</span>}
+                          </div>
+                          <div style={{display:"flex",gap:6}}><input className="t-input" style={{flex:1,fontSize:11,padding:"5px 8px",borderColor:"#fca5a5"}} value={exInputs[field]||""} placeholder="Add exclude keyword… (e.g. not eligible)" onChange={e=>setExInputs(p=>({...p,[field]:e.target.value}))} onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();addExKw2(field);}}}/><button className="t-btn t-btn-sm" style={{background:"#fee2e2",color:"#991b1b",border:"1.5px solid #fca5a5",padding:"4px 10px",fontSize:11,fontFamily:"var(--fd)",fontWeight:700,cursor:"pointer"}} onClick={()=>addExKw2(field)}>✗ Add</button></div>
                         </div>
                       );
                     })}

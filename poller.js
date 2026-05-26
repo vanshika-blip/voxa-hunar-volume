@@ -1091,9 +1091,11 @@ async function _syncAgentQL(agent, userRoleMap, triggerMap) {
   // Log the active rule so it's visible in Render logs
   const ruleDesc = (() => {
     if (agent.qualificationRules?.length) {
-      return agent.qualificationRules.map(r =>
-        `${r.field} contains [${(r.keywords||[]).join('|')}]`
-      ).join(' AND ');
+      return agent.qualificationRules.map(r => {
+        const inc = (r.keywords||[]).join('|') || 'any';
+        const exc = (r.excludeKeywords||[]).join('|');
+        return `${r.field} includes[${inc}]${exc ? ` excludes[${exc}]` : ''}`;
+      }).join(' AND ');
     }
     if (agent.qualificationField) {
       const vals = agent.qualificationValues || [];
