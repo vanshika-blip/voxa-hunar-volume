@@ -1586,8 +1586,14 @@ async function handleGetDashboard(actor, body) {
     for (const a of dedupeAgentsBySsId(vis)) {
       if (!a.spreadsheetId) continue;
       try {
-        const { headers: mh, rows: mr } = await readSheet(a.spreadsheetId, AGT.MT);
-        if (!mh.length) continue;
+        const { headers: mh, rows: activeMr } = await readSheet(a.spreadsheetId, AGT.MT);
+if (!mh.length) continue;
+let archMr = [];
+try {
+  const { rows: ar } = await readSheet(a.spreadsheetId, 'Master_Tracker_Archive');
+  archMr = ar;
+} catch(_) {}
+const mr = [...activeMr, ...archMr];
         const ri  = mh.indexOf('Request ID');
         const di  = mh.indexOf('Duration (Minutes)');
         const si  = mh.indexOf('Started At');
