@@ -1176,8 +1176,12 @@ async function _refreshCampaignTracker(agent, agentSsId, mtHeaders, mtRows) {
     const { headers: ctHeaders, rows: ctRows } = await readSheet(agent.spreadsheetId || MAIN_SS_ID, ctName);
     if (!ctHeaders.length || !ctRows.length) return;
 
-    const reqIdCol  = mtHeaders.indexOf('Request ID');
-    const statusCol = mtHeaders.indexOf('Status');
+    try {
+  const { rows: ar } = await readSheet(agentSsId, AGT.MASTER_TRACKER_ARCH);
+  if (ar.length) mtRows = [...mtRows, ...ar];
+} catch(_) {}
+const reqIdCol  = mtHeaders.indexOf('Request ID');
+const statusCol = mtHeaders.indexOf('Status');
     const durCol    = mtHeaders.indexOf('Duration (Minutes)');
     const ctReqCol  = ctHeaders.indexOf('Request ID');
 
