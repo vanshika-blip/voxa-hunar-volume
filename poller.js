@@ -1179,9 +1179,7 @@ async function _refreshCampaignTracker(agent, agentSsId, mtHeaders, mtRows) {
     const reqIdCol  = mtHeaders.indexOf('Request ID');
     const statusCol = mtHeaders.indexOf('Status');
     const durCol    = mtHeaders.indexOf('Duration (Minutes)');
-    const abiCol    = mtHeaders.indexOf('Answered By');   // for connected count
     const ctReqCol  = ctHeaders.indexOf('Request ID');
-    const ccIdx     = ctHeaders.indexOf('Contacts Count'); // campaign target from CT row
 
     const stats = {};
     mtRows.forEach(r => {
@@ -1193,13 +1191,7 @@ async function _refreshCampaignTracker(agent, agentSsId, mtHeaders, mtRows) {
       if (s === 'COMPLETED') {
         stats[rid].completed++;
         stats[rid].minutes += Number(r[durCol] || 0);
-        // Connected = call was actually answered (Answered By non-empty).
-        // Falls back to counting all COMPLETED if the column is absent.
-        if (abiCol >= 0) {
-          if (String(r[abiCol] || '').trim()) stats[rid].connected++;
-        } else {
-          stats[rid].connected++;
-        }
+        stats[rid].connected++; // ← CHANGED: always same as completed
       }
       if (s === 'NOT_CONNECTED') stats[rid].notConnected++;
       if (s === 'FAILED' || s === 'CANCELLED') stats[rid].failed++;
@@ -1221,28 +1213,24 @@ async function _refreshCampaignTracker(agent, agentSsId, mtHeaders, mtRows) {
       const s = stats[rid];
       if (!s) return;
 
-      // FIX: use Contacts Count from CT row as the completion target.
-      // s.total is only the rows currently seeded in MT — if seeding is still
-      // in progress done >= s.total would mark COMPLETED prematurely.
-      const contactsTarget = ccIdx >= 0 && Number(r[ccIdx] || 0) > 0
-        ? Number(r[ccIdx])
-        : s.total;
+      // ← ADD: FREEZE — never re-edit a campaign already COMPLETED
+      const currentStatus = String(r[ctHeaders.indexOf('Status')] || '').toUpperCase();
+      if (currentStatus === 'COMPLETED') return;
 
       const done = s.completed + s.notConnected + s.failed;
-      const newStatus = done >= contactsTarget && s.total >= contactsTarget
-        ? 'COMPLETED'
-        : 'IN_PROGRESS';
+      const newStatus = done >= s.total ? 'COMPLETED' : 'IN_PROGRESS'; // ← CHANGED: use s.total directly
 
       const newRow = [...r];
       const set = (name, val) => { const k = ctHeaders.indexOf(name); if (k >= 0) newRow[k] = val; };
-      set('Status',        newStatus);
-      set('Completed',     s.completed);
-      set('Connected',     s.connected);   // FIX: actual answered count
-      set('Not Connected', s.notConnected);
-      set('Failed',        s.failed);
-      set('Qualified',     s.qualified);
-      set('Actual Minutes', Math.round(s.minutes * 100) / 100);
-      set('Last Updated',  new Date().toISOString());
+      set('Contacts Count',  s.total);       // ← ADD: always from MT
+      set('Status',          newStatus);
+      set('Completed',       s.completed);
+      set('Connected',       s.completed);   // ← CHANGED: same as completed
+      set('Not Connected',   s.notConnected);
+      set('Failed',          s.failed);
+      set('Qualified',       s.qualified);
+      set('Actual Minutes',  Math.round(s.minutes * 100) / 100);
+      set('Last Updated',    new Date().toISOString());
       updates.push({ rowIndex: idx + 2, values: newRow });
     });
 
