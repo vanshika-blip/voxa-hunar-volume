@@ -2476,6 +2476,7 @@ async function handleNcRetry(actor, body) {
 }
 
 
+async function handleDedupeNow(actor) {
   if (actor.role !== 'super_admin') return { ok: false, error: 'FORBIDDEN' };
   try { const r = await dedupeAllSheets(); return { ok: true, ...r }; } catch (e) { return { ok: false, error: e.message }; }
 }
