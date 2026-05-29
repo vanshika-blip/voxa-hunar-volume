@@ -871,14 +871,50 @@ async function processOne({ i, row, callId, status, reqId, campaignDone }) {
       const mobileCol     = mtHeaders.indexOf('Mobile Number');
       const trigByCol     = mtHeaders.indexOf('Triggered By');
       const retryDate     = new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString().slice(0, 10);
-      ncAppends.push([
-        callId,
-        calleeNameCol >= 0 ? String(row[calleeNameCol] || '') : '',
-        mobileCol     >= 0 ? String(row[mobileCol]     || '') : '',
-        newStatus, reqId, 0, 0, '',
-        trigByCol >= 0 ? String(row[trigByCol] || '') : '',
-        new Date().toISOString(), retryDate, 'PENDING', '',
-      ]);
+
+      // Build NC row using NC sheet headers so in.* custom_variable columns
+      // are populated — critical for NC auto-retry to pass them back to Hunar.
+      // NC_H base: ['Call ID','Callee Name','Mobile Number','Status','Request ID',
+      //   'Retry Count','Retries Left','Next Retry Scheduled At','Triggered By',
+      //   'Last Updated','Retry Scheduled Date','Trigger Status','Retry Request ID']
+      // Agent sheets also add in.<cv> columns after the base (ensureSheet adds them).
+      const { headers: ncHdr } = await readSheet(agentSsId, ncName).catch(() => ({ headers: [] }));
+      let ncRow;
+      if (ncHdr.length > 0) {
+        ncRow = new Array(ncHdr.length).fill('');
+        const setNC = (name, val) => { const k = ncHdr.indexOf(name); if (k >= 0) ncRow[k] = val; };
+        setNC('Call ID',              callId);
+        setNC('Callee Name',          calleeNameCol >= 0 ? String(row[calleeNameCol] || '') : '');
+        setNC('Mobile Number',        mobileCol     >= 0 ? String(row[mobileCol]     || '') : '');
+        setNC('Status',               newStatus);
+        setNC('Request ID',           reqId);
+        setNC('Retry Count',          0);
+        setNC('Retries Left',         3);
+        setNC('Triggered By',         trigByCol >= 0 ? String(row[trigByCol] || '') : '');
+        setNC('Last Updated',         new Date().toISOString());
+        setNC('Retry Scheduled Date', retryDate);
+        setNC('Trigger Status',       'PENDING');
+        setNC('Retry Request ID',     '');
+        // Mirror in.* custom variable values from MT row → NC row
+        // so _ncRetryAgent can recover them when firing the retry bulk call
+        customVars.forEach(cv => {
+          const mtCol = mtHeaders.indexOf('in.' + cv);
+          const ncCol = ncHdr.indexOf('in.' + cv);
+          if (mtCol >= 0 && ncCol >= 0) ncRow[ncCol] = row[mtCol] !== undefined ? row[mtCol] : '';
+        });
+      } else {
+        // Fallback: fixed-width 13-column row (NC_H base order)
+        ncRow = [
+          callId,
+          calleeNameCol >= 0 ? String(row[calleeNameCol] || '') : '',
+          mobileCol     >= 0 ? String(row[mobileCol]     || '') : '',
+          newStatus, reqId, 0, 3, '',
+          trigByCol >= 0 ? String(row[trigByCol] || '') : '',
+          new Date().toISOString(), retryDate, 'PENDING', '',
+        ];
+      }
+
+      ncAppends.push(ncRow);
       ncExistingIds.add(callId);
     }
   }
@@ -2182,6 +2218,20 @@ async function _ncRetryAgent(agent, todayStr, userMap) {
     return { fired: 0, groups: 0 };
   }
 
+  // Pre-map custom_variable column indices from NC sheet headers (in.* columns)
+  // NC sheet was seeded from MT which has in.<cv> columns — we need to read them back
+  const customVars = agent.customVariables || [];
+  const cvColMap = {}; // cv name → column index in NC sheet
+  customVars.forEach(cv => {
+    const col = nh.indexOf('in.' + cv);
+    if (col >= 0) cvColMap[cv] = col;
+    // Also try without 'in.' prefix in case NC sheet was populated differently
+    else {
+      const col2 = nh.indexOf(cv);
+      if (col2 >= 0) cvColMap[cv] = col2;
+    }
+  });
+
   // Pick eligible rows: PENDING + retry date elapsed + no prior retry request
   const eligible = [];
   for (let i = 0; i < nrows.length; i++) {
@@ -2201,11 +2251,21 @@ async function _ncRetryAgent(agent, todayStr, userMap) {
     const trigBy = String(row[trigByCol] || '').toLowerCase().trim();
     if (!trigBy) continue; // skip if no original recruiter to attribute
 
+    // Build custom_data from in.* columns in NC sheet
+    const customData = {};
+    customVars.forEach(cv => {
+      if (cvColMap[cv] !== undefined) {
+        const val = String(row[cvColMap[cv]] || '').trim();
+        if (val) customData[cv] = val;
+      }
+    });
+
     eligible.push({
       rowIndex: i + 2,
       trigBy,
       mobile,
       name: String(row[nameCol] || ''),
+      customData,
       origRow: row,
     });
   }
@@ -2242,7 +2302,10 @@ async function _ncRetryAgent(agent, todayStr, userMap) {
       data: unique.map(it => ({
         callee_name: it.name,
         mobile_number: it.mobile,
-        custom_data: {},
+        // Pass through the custom_data recovered from in.* columns in NC sheet.
+        // Without this, Hunar returns HTTP 422 "Missing required variables: <cv>"
+        // for agents that mandate custom_variables (e.g. city_name).
+        custom_data: it.customData || {},
       })),
       remove_invalid_rows: true,
       remove_duplicate_phone_numbers: true,

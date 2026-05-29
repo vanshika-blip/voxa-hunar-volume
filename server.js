@@ -33,6 +33,7 @@ const {
   repairUnassignedLeads, cleanupExpiredSessions, dedupeAllSheets,
   archiveCompletedLeads, archiveCompletedMT, archiveManualTracker,
   processCallbackQueue, processRetryQueue,
+  processNotConnectedAutoRetry,
   getArchivedLeads, getArchivedMT, getArchivedManual,
   getStatus,
   scheduleAgentPoll,
@@ -2451,7 +2452,30 @@ async function handleForceQualify(actor, body) {
   }
 }
 
-async function handleDedupeNow(actor) {
+async function handleNcRetry(actor, body) {
+  // Called by GAS ncForceRetryUI → _ncForceRetryForAgent → POST /api {action:'ncretry'}
+  // Also callable directly from the portal admin UI.
+  // Runs NC auto-retry for a single agent (or all agents if no agentCode given).
+  // The actual logic lives in processNotConnectedAutoRetry() in poller.js.
+  if (!isTLLike(actor.role)) return { ok: false, error: 'FORBIDDEN' };
+  const agentCode = String(body.agentCode || '').trim() || null;
+  // Only super_admin may run across all agents; TL/IC must specify an agent
+  if (!agentCode && actor.role !== 'super_admin') return { ok: false, error: 'AGENT_CODE_REQUIRED' };
+  if (agentCode) {
+    const agent = await findAgent(agentCode);
+    if (!agent) return { ok: false, error: 'AGENT_NOT_FOUND' };
+    if (!agent.active) return { ok: false, error: 'AGENT_INACTIVE' };
+  }
+  try {
+    const result = await processNotConnectedAutoRetry(agentCode);
+    audit(actor.email, 'nc_retry', agentCode || 'all', `fired=${result.totalFired}`).catch(() => {});
+    return { ok: true, fired: result.totalFired, groups: result.agents, agentCode: agentCode || 'all' };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+
   if (actor.role !== 'super_admin') return { ok: false, error: 'FORBIDDEN' };
   try { const r = await dedupeAllSheets(); return { ok: true, ...r }; } catch (e) { return { ok: false, error: e.message }; }
 }
@@ -2523,6 +2547,7 @@ async function handleAction(body) {
     case 'forcequalifyleads':    return handleForceQualify(actor, body);
     case 'pollnow':              return actor.role === 'super_admin' ? (pollActiveBatches().catch(() => {}), { ok: true, message: 'Poll triggered.' }) : { ok: false, error: 'FORBIDDEN' };
     case 'backfillnow':          return actor.role === 'super_admin' ? (backfillMissingOutputs().catch(() => {}), { ok: true, message: 'Backfill triggered.' }) : { ok: false, error: 'FORBIDDEN' };
+    case 'ncretry':              return handleNcRetry(actor, body);
     case 'forcerebuilddashboard': return handleForceRebuildDashboard(actor);
     case 'killjobs':             return { ok: true, message: 'Use Render dashboard to stop the server.' };
     case 'installtriggers':      return { ok: true, message: 'Node handles all background jobs automatically.' };
