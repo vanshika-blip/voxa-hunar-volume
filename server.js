@@ -1386,10 +1386,22 @@ async function handleGetMasterTracker(actor, body) {
   if (!agentCode) return { ok: false, error: 'AGENT_CODE_REQUIRED' };
   const agent = await findAgent(agentCode);
   if (!agent || !agent.spreadsheetId) return { ok: false, error: 'AGENT_NOT_FOUND' };
-  const usersVis = await getAllUsers();
-  const { headers, rows } = await readSheet(agent.spreadsheetId, AGT.MT);
   const reqId = String(body.requestId || '');
-  let result  = rows.map(r => { const o = {}; headers.forEach((h, i) => { o[h] = r[i]; }); return o; });
+
+  // Read live Master_Tracker
+  const { headers, rows } = await readSheet(agent.spreadsheetId, AGT.MT);
+  let result = rows.map(r => { const o = {}; headers.forEach((h, i) => { o[h] = r[i]; }); return o; });
+
+  // Also read Master_Tracker_Archive — rows get moved here after campaigns complete,
+  // so without this merge, completed campaigns show "No completed calls yet".
+  try {
+    const { headers: ah, rows: ar } = await readSheet(agent.spreadsheetId, 'Master_Tracker_Archive');
+    if (ah.length && ar.length) {
+      const archRows = ar.map(r => { const o = {}; ah.forEach((h, i) => { o[h] = r[i]; }); return o; });
+      result = [...result, ...archRows];
+    }
+  } catch (_) {}
+
   if (reqId) result = result.filter(r => String(r['Request ID'] || '') === reqId);
   return { ok: true, rows: result, headers };
 }
