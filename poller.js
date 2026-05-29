@@ -2104,6 +2104,214 @@ async function _seedMasterTracker(agent, createdCalls, requestId, triggeredBy) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// JOB 10b: NC AUTO-RETRY
+// Picks NOT_CONNECTED rows from each agent's Not_Connected sheet where the
+// 7-day retry gate has elapsed and Trigger Status is still PENDING, groups
+// them by the ORIGINAL recruiter (Triggered By email), and fires one bulk
+// call per (agent, recruiter) group as a fresh NOTCONNECTED_* campaign.
+//
+//   • request_id pattern:  NOTCONNECTED_<recruiterSlug>_<agentSlug>_<YYYYMMDD>
+//   • Triggered By:        original recruiter (so QL routes leads back to them)
+//   • Campaign Tracker:    new row appears → recruiter sees campaign in portal
+//   • Trigger Log:         minutes logged under recruiter (counts toward daily
+//                          totals) but daily-limit check is intentionally
+//                          skipped — auto-retries never blocked by quota
+//   • NC row marked TRIGGERED + Retry Request ID → never auto-retried again
+//
+// Called by:
+//   • Daily 11am IST cron (no filter → runs across all active agents)
+//   • Manual one-off via processNotConnectedAutoRetry(agentCode)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function processNotConnectedAutoRetry(agentCodeFilter = null) {
+  console.log('[nc-retry] Starting NC auto-retry'
+    + (agentCodeFilter ? ` for ${agentCodeFilter}` : ' for all active agents') + '…');
+
+  const agents = (await getAllAgents()).filter(a => a.active && a.spreadsheetId);
+  const targets = agentCodeFilter
+    ? agents.filter(a => a.agentCode === agentCodeFilter)
+    : agents;
+
+  if (!targets.length) {
+    console.log('[nc-retry] No matching agents — skipping.');
+    return { ok: true, totalFired: 0, agents: 0 };
+  }
+
+  const users = await getAllUsers();
+  const userMap = {};
+  users.forEach(u => { userMap[u.email] = u; });
+
+  const todayStr = istDateStr();
+  let totalFired = 0;
+
+  for (const agent of targets) {
+    try {
+      const stats = await _ncRetryAgent(agent, todayStr, userMap);
+      totalFired += stats.fired;
+      if (stats.fired > 0) {
+        console.log(`[nc-retry] ${agent.agentCode}: fired ${stats.fired} contacts across ${stats.groups} recruiter group(s)`);
+      }
+      await sleep(2000);
+    } catch (e) {
+      console.error(`[nc-retry] Error on ${agent.agentCode}: ${e.message}`);
+    }
+  }
+
+  console.log(`[nc-retry] Done. Total contacts fired: ${totalFired}`);
+  return { ok: true, totalFired, agents: targets.length };
+}
+
+async function _ncRetryAgent(agent, todayStr, userMap) {
+  const agentSsId = agent.spreadsheetId;
+  const ncName = AGT.NOT_CONNECTED;
+  const ctName = AGT.CAMPAIGN_TRACKER;
+
+  const { headers: nh, rows: nrows } = await readSheet(agentSsId, ncName);
+  if (!nh.length || !nrows.length) return { fired: 0, groups: 0 };
+
+  const tsCol     = nh.indexOf('Trigger Status');
+  const reqIdCol  = nh.indexOf('Retry Request ID');
+  const dateCol   = nh.indexOf('Retry Scheduled Date');
+  const trigByCol = nh.indexOf('Triggered By');
+  const nameCol   = nh.indexOf('Callee Name');
+  const mobCol    = nh.indexOf('Mobile Number');
+  const updCol    = nh.indexOf('Last Updated');
+
+  if (tsCol < 0 || reqIdCol < 0 || dateCol < 0 || trigByCol < 0 || mobCol < 0) {
+    console.warn(`[nc-retry] ${agent.agentCode}: NC sheet missing required columns — skipping`);
+    return { fired: 0, groups: 0 };
+  }
+
+  // Pick eligible rows: PENDING + retry date elapsed + no prior retry request
+  const eligible = [];
+  for (let i = 0; i < nrows.length; i++) {
+    const row = nrows[i];
+    const ts   = String(row[tsCol] || '').toUpperCase();
+    const rrid = String(row[reqIdCol] || '').trim();
+    if (ts !== 'PENDING' || rrid) continue;
+
+    const rawDate = row[dateCol];
+    const dateStr = (rawDate instanceof Date)
+      ? istDateStr(rawDate)
+      : String(rawDate || '').slice(0, 10);
+    if (!dateStr || dateStr > todayStr) continue; // 7-day gate
+
+    const mobile = String(row[mobCol] || '').trim();
+    if (!mobile) continue;
+    const trigBy = String(row[trigByCol] || '').toLowerCase().trim();
+    if (!trigBy) continue; // skip if no original recruiter to attribute
+
+    eligible.push({
+      rowIndex: i + 2,
+      trigBy,
+      mobile,
+      name: String(row[nameCol] || ''),
+      origRow: row,
+    });
+  }
+
+  if (!eligible.length) return { fired: 0, groups: 0 };
+
+  // Group by recruiter email
+  const groups = new Map();
+  for (const e of eligible) {
+    if (!groups.has(e.trigBy)) groups.set(e.trigBy, []);
+    groups.get(e.trigBy).push(e);
+  }
+
+  const todayCompact = todayStr.replace(/-/g, '');
+  const agentSlug = agent.agentCode.replace(/[^a-z0-9]/gi, '').slice(0, 12);
+  let totalFired = 0;
+
+  for (const [recruiter, items] of groups) {
+    // Dedupe by mobile inside the group
+    const seen = new Set();
+    const unique = items.filter(it => {
+      if (seen.has(it.mobile)) return false;
+      seen.add(it.mobile);
+      return true;
+    });
+    if (!unique.length) continue;
+
+    const recruiterSlug = recruiter.split('@')[0].replace(/[^a-z0-9]/gi, '').slice(0, 12);
+    const newReqId = `NOTCONNECTED_${recruiterSlug}_${agentSlug}_${todayCompact}`;
+
+    const payload = {
+      agent_id: agent.agentId,
+      request_id: newReqId,
+      data: unique.map(it => ({
+        callee_name: it.name,
+        mobile_number: it.mobile,
+        custom_data: {},
+      })),
+      remove_invalid_rows: true,
+      remove_duplicate_phone_numbers: true,
+      timezone: 'Asia/Kolkata',
+    };
+
+    const result = await bulkCall(payload);
+    if (!result.ok) {
+      console.error(`[nc-retry] ${agent.agentCode}/${recruiter}: bulkCall failed: ${result.error}`);
+      continue;
+    }
+
+    const createdCalls = Array.isArray(result.data) ? result.data : [];
+    const nowIso = new Date().toISOString();
+    const estMin = Math.round((unique.length * (agent.estSecondsPerCall || 60) / 60) * 10) / 10;
+
+    // 1) Seed Master Tracker rows under the ORIGINAL recruiter so QL routes correctly
+    await _seedMasterTracker(agent, createdCalls, newReqId, recruiter);
+
+    // 2) Seed Campaign Tracker so the campaign appears in the recruiter's portal view
+    const campName = `NC Auto-Retry ${agent.agentCode}`;
+    try {
+      await appendRows(agentSsId, ctName, [[
+        newReqId, campName, recruiter, nowIso, unique.length, 'IN_PROGRESS',
+        0, 0, 0, 0, 0, 0, estMin, nowIso,
+      ]]);
+    } catch (e) {
+      console.warn(`[nc-retry] ${agent.agentCode}: could not seed Campaign_Tracker: ${e.message}`);
+    }
+
+    // 3) Trigger Log — minutes attribute to recruiter; daily-limit check intentionally skipped
+    try {
+      const ruser = userMap[recruiter] || {};
+      await appendRows(MAIN_SS_ID, PORTAL.TRIGGER_LOG, [[
+        nowIso, recruiter, ruser.name || '', ruser.team || '',
+        agent.agentCode, newReqId, unique.length, estMin,
+      ]]);
+    } catch (e) {
+      console.warn(`[nc-retry] ${agent.agentCode}: could not log to Trigger Log: ${e.message}`);
+    }
+
+    // 4) Mark NC rows TRIGGERED + Retry Request ID so they never auto-retry again
+    const triggeredMobiles = new Set(unique.map(u => u.mobile));
+    const ncUpdates = [];
+    for (const item of items) {
+      if (!triggeredMobiles.has(item.mobile)) continue;
+      const newRow = [...item.origRow];
+      newRow[tsCol]    = 'TRIGGERED';
+      newRow[reqIdCol] = newReqId;
+      if (updCol >= 0) newRow[updCol] = nowIso;
+      ncUpdates.push({ rowIndex: item.rowIndex, values: newRow });
+    }
+    if (ncUpdates.length) {
+      try { await batchWriteRows(agentSsId, ncName, ncUpdates); }
+      catch (e) { console.warn(`[nc-retry] ${agent.agentCode}: could not mark NC rows: ${e.message}`); }
+    }
+
+    // 5) Register for the 10-min intensive poll window so new calls update fast
+    try { registerFreshCampaign(agent.agentCode, newReqId); } catch (_) {}
+
+    totalFired += unique.length;
+    console.log(`[nc-retry] ${agent.agentCode}/${recruiter}: fired ${unique.length} as ${newReqId}`);
+    await sleep(1500);
+  }
+
+  return { fired: totalFired, groups: groups.size };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // EOD SWEEP — runs daily at 9pm IST
 // For every active campaign (not COMPLETED in Campaign Tracker),
 // fetches ALL non-terminal rows with no cap — cleans up end-of-day stragglers
@@ -2435,7 +2643,10 @@ async function startPoller() {
   cron.schedule('30 5 * * *', async () => {
     try { await processCallbackQueue(); } catch (e) { console.error('[cron:callbacks]', e.message); }
     await sleep(30000);
-    try { await processRetryQueue(); } catch (e) { console.error('[cron:retries]', e.message); }
+    // NC auto-retry replaces the old _Retry_Queue path. Picks any PENDING NC row
+    // whose Retry Scheduled Date has elapsed, groups by original recruiter,
+    // fires NOTCONNECTED_<recruiter>_<agent>_<YYYYMMDD>. See processNotConnectedAutoRetry().
+    try { await processNotConnectedAutoRetry(); } catch (e) { console.error('[cron:nc-retry]', e.message); }
   });
 
   // 9pm IST = 15:30 UTC — end of day sweep, all active campaigns fully updated
@@ -2501,6 +2712,7 @@ module.exports = {
   archiveManualTracker,
   processCallbackQueue,
   processRetryQueue,
+  processNotConnectedAutoRetry,
   eodSweep,
   getArchivedLeads,
   getArchivedMT,

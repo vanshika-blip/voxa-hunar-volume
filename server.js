@@ -2451,6 +2451,190 @@ async function handleForceQualify(actor, body) {
   }
 }
 
+async function handleNCRetry(actor, body) {
+  if (!isTLLike(actor.role)) return { ok: false, error: 'FORBIDDEN' };
+
+  const agentCode = String(body.agentCode || '').trim();
+  if (!agentCode) return { ok: false, error: 'AGENT_CODE_REQUIRED' };
+
+  const agent = await findAgent(agentCode);
+  if (!agent)               return { ok: false, error: 'AGENT_NOT_FOUND' };
+  if (!agent.active)        return { ok: false, error: 'AGENT_INACTIVE' };
+  if (!agent.spreadsheetId) return { ok: false, error: 'AGENT_NO_SPREADSHEET' };
+
+  const [allAgents, allUsers] = await Promise.all([getAllAgents(), getAllUsers()]);
+  const vis = agentsVisibleTo(actor, allAgents, allUsers);
+  if (!vis.find(a => a.agentCode === agentCode)) return { ok: false, error: 'AGENT_NOT_VISIBLE' };
+
+  const { headers: nh, rows: nrows } = await readSheet(agent.spreadsheetId, AGT.NC);
+  if (!nh.length) return { ok: true, fired: 0, groups: 0, message: 'NC sheet is empty.' };
+
+  const tsCol     = nh.indexOf('Trigger Status');
+  const reqIdCol  = nh.indexOf('Retry Request ID');
+  const dateCol   = nh.indexOf('Retry Scheduled Date');
+  const trigByCol = nh.indexOf('Triggered By');
+  const nameCol   = nh.indexOf('Callee Name');
+  const mobCol    = nh.indexOf('Mobile Number');
+  const updCol    = nh.indexOf('Last Updated');
+
+  if (tsCol < 0 || reqIdCol < 0 || dateCol < 0 || trigByCol < 0 || mobCol < 0) {
+    return { ok: false, error: 'NC_SHEET_MISSING_COLUMNS',
+      message: 'NC sheet is missing required columns. Run Repair Agent Sheets first.' };
+  }
+
+  const todayStr = istDateStr();
+  const eligible = [];
+
+  for (let i = 0; i < nrows.length; i++) {
+    const row  = nrows[i];
+    const ts   = String(row[tsCol]    || '').toUpperCase().trim();
+    const rrid = String(row[reqIdCol] || '').trim();
+    if (ts !== 'PENDING' || rrid) continue;
+
+    const rawDate = row[dateCol];
+    let dateStr;
+    if (rawDate instanceof Date) {
+      dateStr = rawDate.toLocaleDateString('en-CA', { timeZone: IST_TZ });
+    } else {
+      dateStr = String(rawDate || '').slice(0, 10);
+    }
+    if (!dateStr || dateStr > todayStr) continue;
+
+    const mobile = String(row[mobCol]    || '').trim();
+    const trigBy = String(row[trigByCol] || '').toLowerCase().trim();
+    if (!mobile || !trigBy) continue;
+
+    eligible.push({ rowIndex: i + 2, trigBy, mobile, name: String(row[nameCol] || ''), origRow: row });
+  }
+
+  if (!eligible.length) {
+    return { ok: true, fired: 0, groups: 0,
+      message: 'No eligible NC leads found (none are PENDING past their 7-day gate).' };
+  }
+
+  const groups = {};
+  for (const e of eligible) {
+    if (!groups[e.trigBy]) groups[e.trigBy] = [];
+    groups[e.trigBy].push(e);
+  }
+
+  const userMap = {};
+  allUsers.forEach(u => { userMap[u.email] = u; });
+
+  const todayCompact = todayStr.replace(/-/g, '');
+  const agentSlug    = agentCode.replace(/[^a-z0-9]/gi, '').slice(0, 12);
+
+  let totalFired = 0;
+  let groupCount = 0;
+  const ncSheetUpdates = [];
+
+  for (const [recruiter, items] of Object.entries(groups)) {
+    const seen   = {};
+    const unique = items.filter(it => { if (seen[it.mobile]) return false; seen[it.mobile] = true; return true; });
+    if (!unique.length) continue;
+
+    const recruiterSlug = recruiter.split('@')[0].replace(/[^a-z0-9]/gi, '').slice(0, 12);
+    const newReqId = `NOTCONNECTED_${recruiterSlug}_${agentSlug}_${todayCompact}`;
+
+    const payload = {
+      agent_id:   agent.agentId,
+      request_id: newReqId,
+      data: unique.map(it => ({ callee_name: it.name, mobile_number: it.mobile, custom_data: {} })),
+      remove_invalid_rows: true,
+      remove_duplicate_phone_numbers: true,
+      timezone: IST_TZ || 'Asia/Kolkata',
+    };
+
+    const result = await hunarPost('/external/v1/calls/bulk/', payload);
+    if (!result.ok) {
+      console.warn(`[nc-retry] ${agentCode}/${recruiter}: bulkCall failed: ${result.error}`);
+      continue;
+    }
+
+    const createdCalls = Array.isArray(result.data) ? result.data : [];
+    const now          = new Date();
+    const estMin       = Math.round((unique.length * (agent.estSecondsPerCall || 60) / 60) * 10) / 10;
+    const ruser        = userMap[recruiter] || {};
+
+    // Seed Master_Tracker
+    if (createdCalls.length) {
+      try {
+        const { headers: mth, rows: mtRows } = await readSheet(agent.spreadsheetId, AGT.MT);
+        const existCids = new Set(mtRows.map(r => String(r[mth.indexOf('Call ID')] || '').trim()).filter(Boolean));
+        const mtNewRows = [];
+        for (const c of createdCalls) {
+          const cid = String(c.id || '').trim();
+          if (!cid || existCids.has(cid)) continue;
+          existCids.add(cid);
+          const row = new Array(mth.length).fill('');
+          const set = (n, v) => { const k = mth.indexOf(n); if (k >= 0) row[k] = v; };
+          set('Call ID', cid);
+          set('Request ID', c.request_id || newReqId);
+          set('Callee Name', c.callee_name || '');
+          set('Mobile Number', c.mobile_number || '');
+          set('Status', c.status || 'INITIATED');
+          set('Triggered By', recruiter);
+          set('Created At', now.toISOString());
+          mtNewRows.push(row);
+        }
+        if (mtNewRows.length) await appendRows(agent.spreadsheetId, AGT.MT, mtNewRows);
+      } catch (e) {
+        console.warn(`[nc-retry] MT seed failed: ${e.message}`);
+      }
+    }
+
+    // Seed Campaign_Tracker
+    try {
+      await appendRows(agent.spreadsheetId, AGT.CT, [[
+        newReqId, `NC Auto-Retry ${agentCode}`, recruiter, now.toISOString(),
+        unique.length, 'IN_PROGRESS', 0, 0, 0, 0, 0, 0, estMin, now.toISOString(),
+      ]]);
+    } catch (e) { console.warn(`[nc-retry] CT seed failed: ${e.message}`); }
+
+    // Trigger Log
+    try {
+      await appendRows(MAIN_SS_ID, S.TLOG, [[
+        now.toISOString(), recruiter, ruser.name || '', ruser.team || '',
+        agentCode, newReqId, unique.length, estMin,
+      ]]);
+    } catch (e) { console.warn(`[nc-retry] TLog failed: ${e.message}`); }
+
+    // Mark NC rows as TRIGGERED
+    const triggeredMobiles = new Set(unique.map(it => it.mobile));
+    for (const item of items) {
+      if (!triggeredMobiles.has(item.mobile)) continue;
+      const newVals = [...item.origRow];
+      newVals[tsCol]    = 'TRIGGERED';
+      newVals[reqIdCol] = newReqId;
+      if (updCol >= 0) newVals[updCol] = now.toISOString();
+      ncSheetUpdates.push({ rowIndex: item.rowIndex, values: newVals });
+    }
+
+    totalFired += unique.length;
+    groupCount++;
+    console.log(`[nc-retry] ${agentCode}/${recruiter}: fired ${unique.length} as ${newReqId}`);
+    await sleep(1000);
+  }
+
+  // Batch-write NC sheet updates
+  if (ncSheetUpdates.length) {
+    try {
+      await sheetsHelper.batchWriteRows(agent.spreadsheetId, AGT.NC, ncSheetUpdates);
+    } catch (e) { console.warn(`[nc-retry] NC batch-update failed: ${e.message}`); }
+  }
+
+  audit(actor.email, 'nc_retry', agentCode, `fired=${totalFired} groups=${groupCount}`).catch(() => {});
+
+  return {
+    ok: true,
+    fired:   totalFired,
+    groups:  groupCount,
+    message: totalFired === 0
+      ? 'No eligible NC leads found (none are PENDING past their 7-day gate).'
+      : `Fired ${totalFired} contacts across ${groupCount} recruiter group(s).`,
+  };
+}
+
 async function handleDedupeNow(actor) {
   if (actor.role !== 'super_admin') return { ok: false, error: 'FORBIDDEN' };
   try { const r = await dedupeAllSheets(); return { ok: true, ...r }; } catch (e) { return { ok: false, error: e.message }; }
@@ -2496,6 +2680,7 @@ async function handleAction(body) {
     case 'repairagentsheets':    return handleRepairAgentSheets(actor);
     case 'uploadcontacts':
     case 'triggercampaign':      return handleUploadContacts(actor, body);
+    case 'ncretry':              return handleNCRetry(actor, body);
     case 'getleads':             return handleGetLeads(actor, body);
     case 'updatelead':           return handleUpdateLead(actor, body);
     case 'assignlead':           return handleAssignLead(actor, body);
