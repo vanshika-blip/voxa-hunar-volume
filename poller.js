@@ -866,11 +866,11 @@ async function processOne({ i, row, callId, status, reqId, campaignDone }) {
     const ncRowIdx = ncRows.findIndex(r => String(r[0] || '').trim() === callId);
     if (ncRowIdx >= 0) ncDeletes.push(ncRowIdx + 2);
   } else if ((newStatus === 'NOT_CONNECTED' || newStatus === 'FAILED') && campaignDone) {
-    if (!ncExistingIds.has(callId) && status !== 'COMPLETED') {
+    if (!ncExistingIds.has(callId) && status !== 'COMPLETED' && !String(reqId || '').startsWith('NOTCONNECTED_')) {
       const calleeNameCol = mtHeaders.indexOf('Callee Name');
       const mobileCol     = mtHeaders.indexOf('Mobile Number');
       const trigByCol     = mtHeaders.indexOf('Triggered By');
-      const retryDate     = new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString().slice(0, 10);
+      const retryDate     = new Date().toISOString().slice(0, 10);
 
       // Build NC row using NC sheet headers so in.* custom_variable columns
       // are populated — critical for NC auto-retry to pass them back to Hunar.
@@ -2139,6 +2139,80 @@ async function _seedMasterTracker(agent, createdCalls, requestId, triggeredBy) {
   if (newRows.length) await appendRows(agentSsId, mtName, newRows);
 }
 
+const NC_BASE_H = [
+  'Call ID','Callee Name','Mobile Number','Status','Request ID',
+  'Retry Count','Retries Left','Next Retry Scheduled At','Triggered By',
+  'Last Updated','Retry Scheduled Date','Trigger Status','Retry Request ID',
+];
+
+// Push freshly NOT_CONNECTED Master_Tracker rows into Not_Connected (PENDING).
+// Runs at 9pm IST right after eodSweep. Idempotent; skips retries.
+async function syncNotConnectedFromMT(agentCodeFilter = null) {
+  console.log('[nc-sync] Starting NC sync from Master_Tracker'
+    + (agentCodeFilter ? ` for ${agentCodeFilter}` : '') + '…');
+  const agents = (await getAllAgents()).filter(a => a.active && a.spreadsheetId
+    && (!agentCodeFilter || a.agentCode === agentCodeFilter));
+  const today = istDateStr();
+  let totalAdded = 0;
+
+  for (const agent of agents) {
+    try {
+      const ssId = agent.spreadsheetId;
+      const cv   = agent.customVariables || [];
+      await ensureSheet(ssId, AGT.NOT_CONNECTED, NC_BASE_H.concat(cv.map(v => 'in.' + v)), '#8e44ad');
+
+      const { headers: mtH, rows: mtRows } = await readSheet(ssId, AGT.MASTER_TRACKER);
+      if (!mtH.length || !mtRows.length) continue;
+      const mCall = mtH.indexOf('Call ID'), mStat = mtH.indexOf('Status'),
+            mName = mtH.indexOf('Callee Name'), mMob = mtH.indexOf('Mobile Number'),
+            mTrig = mtH.indexOf('Triggered By'), mReq = mtH.indexOf('Request ID');
+      if (mCall < 0 || mStat < 0) continue;
+
+      const { headers: nh, rows: nrows } = await readSheet(ssId, AGT.NOT_CONNECTED);
+      const nCall = nh.indexOf('Call ID');
+      const existing = new Set();
+      if (nCall >= 0) nrows.forEach(r => { const id = String(r[nCall] || '').trim(); if (id) existing.add(id); });
+
+      const appends = [];
+      for (const row of mtRows) {
+        const callId = String(row[mCall] || '').trim();
+        if (!callId || existing.has(callId)) continue;
+        if (String(row[mStat] || '').toUpperCase() !== 'NOT_CONNECTED') continue;
+        const reqId = mReq >= 0 ? String(row[mReq] || '').trim() : '';
+        if (reqId.startsWith('NOTCONNECTED_')) continue;
+
+        const ncRow = new Array(nh.length).fill('');
+        const set = (name, val) => { const k = nh.indexOf(name); if (k >= 0) ncRow[k] = val; };
+        set('Call ID', callId);
+        set('Callee Name',   mName >= 0 ? String(row[mName] || '') : '');
+        set('Mobile Number', mMob  >= 0 ? String(row[mMob]  || '') : '');
+        set('Status', 'NOT_CONNECTED');
+        set('Request ID', reqId);
+        set('Retry Count', 0);
+        set('Retries Left', 3);
+        set('Triggered By', mTrig >= 0 ? String(row[mTrig] || '') : '');
+        set('Last Updated', new Date().toISOString());
+        set('Retry Scheduled Date', today);
+        set('Trigger Status', 'PENDING');
+        set('Retry Request ID', '');
+        cv.forEach(v => {
+          const mk = mtH.indexOf('in.' + v), nk = nh.indexOf('in.' + v);
+          if (mk >= 0 && nk >= 0) ncRow[nk] = row[mk] !== undefined ? row[mk] : '';
+        });
+        appends.push(ncRow);
+        existing.add(callId);
+      }
+      if (appends.length) {
+        await appendRows(ssId, AGT.NOT_CONNECTED, appends);
+        totalAdded += appends.length;
+        console.log(`[nc-sync] ${agent.agentCode}: +${appends.length} → NC sheet`);
+      }
+      await sleep(1200);
+    } catch (e) { console.error(`[nc-sync] Error on ${agent.agentCode}: ${e.message}`); }
+  }
+  console.log(`[nc-sync] Done. Total added: ${totalAdded}`);
+  return { ok: true, added: totalAdded };
+}
 // ─────────────────────────────────────────────────────────────────────────────
 // JOB 10b: NC AUTO-RETRY
 // Picks NOT_CONNECTED rows from each agent's Not_Connected sheet where the
@@ -2715,6 +2789,7 @@ async function startPoller() {
   // 9pm IST = 15:30 UTC — end of day sweep, all active campaigns fully updated
 cron.schedule('30 15 * * *', async () => {
     try { await eodSweep(); } catch (e) { console.error('[cron:eod]', e.message); }
+    try { await syncNotConnectedFromMT(); } catch (e) { console.error('[cron:nc-sync]', e.message); }
     await sleep(120_000); // wait 2 min for eodSweep writes to settle
     try {
       console.log('[cron:eod] Triggering dashboard cache rebuild after EOD sweep…');
