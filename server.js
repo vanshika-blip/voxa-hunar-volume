@@ -1210,6 +1210,84 @@ async function _getSheetHeaders(ssId, sheetName) {
   } catch (_) { return []; }
 }
 
+// ─── Test Call (single contact, prefixed test_ request ID) ────────────────────
+async function handleTestCall(actor, body) {
+  const agentCode   = String(body.agentCode || '').trim();
+  const calleeName  = String(body.callee_name || body.calleeName || '').trim();
+  const mobileNumber = String(body.mobile_number || body.mobileNumber || '').trim();
+  if (!agentCode)    return { ok: false, error: 'AGENT_CODE_REQUIRED' };
+  if (!calleeName)   return { ok: false, error: 'CALLEE_NAME_REQUIRED' };
+  if (!mobileNumber || mobileNumber.replace(/[^\d]/g, '').length < 10) return { ok: false, error: 'INVALID_MOBILE' };
+
+  const agent = await findAgent(agentCode);
+  if (!agent)               return { ok: false, error: 'AGENT_NOT_FOUND' };
+  if (!agent.active)        return { ok: false, error: 'AGENT_INACTIVE' };
+  if (!agent.spreadsheetId) return { ok: false, error: 'AGENT_NO_SPREADSHEET' };
+
+  const agents   = await getAllAgents();
+  const usersVis = await getAllUsers();
+  if (!agentsVisibleTo(actor, agents, usersVis).find(a => a.agentCode === agentCode)) {
+    return { ok: false, error: 'AGENT_NOT_VISIBLE' };
+  }
+
+  const now    = new Date();
+  const dateTs = now.toISOString().slice(0, 19).replace(/[-:T]/g, '').slice(0, 15);
+  const reqId  = `test_${dateTs}_${actor.email.split('@')[0].replace(/[^a-z0-9]/gi, '').slice(0, 8)}`;
+  const cv     = agent.customVariables || [];
+
+  // Build custom_data from body.custom_data if provided
+  const customData = {};
+  cv.forEach(k => { if (body.custom_data?.[k] !== undefined) customData[k] = String(body.custom_data[k] || ''); });
+
+  const payload = {
+    agent_id: agent.agentId, request_id: reqId,
+    data: [{ callee_name: calleeName, mobile_number: mobileNumber, custom_data: customData }],
+    remove_invalid_rows: true, remove_duplicate_phone_numbers: true, timezone: IST_TZ,
+  };
+
+  const apiRes = await hunarPost('/external/v1/calls/bulk/', payload);
+  if (!apiRes.ok) return { ok: false, error: 'HUNAR_API_ERROR', message: apiRes.error };
+  const calls = Array.isArray(apiRes.data) ? apiRes.data : [];
+  const ssId  = agent.spreadsheetId;
+
+  // Seed Campaign_Tracker (prefixed test_ so it's identifiable, and hidden by _isNcRetryReqId=false but test_ is separate)
+  await appendRows(ssId, AGT.CT, [[reqId, `Test_${actor.email.split('@')[0].slice(0, 8)}_${dateTs}`, actor.email, now.toISOString(), 1, 'IN_PROGRESS', 0, 0, 0, 0, 0, 0, Math.round(agent.estSecondsPerCall / 60 * 10) / 10, now.toISOString()]]);
+
+  // Seed Master_Tracker
+  if (calls.length) {
+    const mtH  = await _getSheetHeaders(ssId, AGT.MT);
+    const mtRows = calls.map(c => {
+      const cid = String(c.id || '').trim();
+      if (!cid) return null;
+      const row = new Array(mtH.length).fill('');
+      const set = (n, v) => { const k = mtH.indexOf(n); if (k >= 0) row[k] = v; };
+      set('Call ID', cid); set('Request ID', c.request_id || reqId);
+      set('Callee Name', c.callee_name || calleeName); set('Mobile Number', c.mobile_number || mobileNumber);
+      set('Status', c.status || 'INITIATED'); set('Triggered By', actor.email);
+      set('Created At', now.toISOString());
+      return row;
+    }).filter(Boolean);
+    if (mtRows.length) await appendRows(ssId, AGT.MT, mtRows);
+  }
+
+  // Trigger log (1 contact, 1 call)
+  const estMin = agent.estSecondsPerCall / 60;
+  const users  = await getAllUsers();
+  const actorFull = users.find(u => u.email === actor.email);
+  await appendRows(MAIN_SS_ID, S.TLOG, [[now.toISOString(), actor.email, actorFull?.name || '', actor.team || '', agentCode, reqId, 1, estMin]]);
+  audit(actor.email, 'test_call', `${agentCode}:${reqId}`, `${calleeName}|${mobileNumber}`).catch(() => {});
+
+  registerFreshCampaign(agentCode, reqId);
+  scheduleAgentPoll(agentCode, 2 * 60 * 1000);
+
+  return {
+    ok: true, agentCode, requestId: reqId,
+    callId: calls[0]?.id || '',
+    calleeName, mobileNumber,
+    message: 'Test call triggered successfully.',
+  };
+}
+
 // ─── Leads ─────────────────────────────────────────────────────────────────────
 async function handleGetLeads(actor, body) {
   const agents = await getAllAgents();
@@ -1472,6 +1550,10 @@ async function handleGetNotConnected(actor, body) {
 }
 
 // ─── Campaigns ─────────────────────────────────────────────────────────────────
+function _isNcRetryReqId(reqId) {
+  return String(reqId || '').startsWith('NOTCONNECTED_');
+}
+
 async function handleGetCampaigns(actor, body) {
   const agents = await getAllAgents();
   const users  = await getAllUsers();
@@ -1492,6 +1574,8 @@ async function handleGetCampaigns(actor, body) {
       rows.forEach(r => {
         if (!r[0]) return;
         const reqId = String(r[0]).trim();
+        // Hide NC auto-retry campaigns from the UI
+        if (_isNcRetryReqId(reqId)) return;
         // Dedupe by requestId — same campaign must not appear twice
         if (seenReqIds.has(reqId)) return;
         seenReqIds.add(reqId);
@@ -2608,6 +2692,7 @@ async function handleAction(body) {
     case 'pollnow':              return actor.role === 'super_admin' ? (pollActiveBatches().catch(() => {}), { ok: true, message: 'Poll triggered.' }) : { ok: false, error: 'FORBIDDEN' };
     case 'backfillnow':          return actor.role === 'super_admin' ? (backfillMissingOutputs().catch(() => {}), { ok: true, message: 'Backfill triggered.' }) : { ok: false, error: 'FORBIDDEN' };
     case 'ncretry':              return handleNcRetry(actor, body);
+    case 'testcall':             return handleTestCall(actor, body);
     case 'forcerebuilddashboard': return handleForceRebuildDashboard(actor);
     case 'killjobs':             return { ok: true, message: 'Use Render dashboard to stop the server.' };
     case 'installtriggers':      return { ok: true, message: 'Node handles all background jobs automatically.' };

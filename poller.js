@@ -545,6 +545,131 @@ function isPollingHours() {
   return true;
 }
 
+// ─── NC retry request ID filter (mirrors GAS _isNcRetryReqId) ────────────────
+function isNcRetryReqId(reqId) {
+  return String(reqId || '').startsWith('NOTCONNECTED_');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DEDICATED NC + COMPLETED SWEEP (runs at 1pm and 9pm IST)
+//
+// Order of operations per agent:
+//   1. NOT_CONNECTED rows — oldest Created At first
+//   2. COMPLETED rows missing out.* data (backfill)
+//   3. Any SCHEDULED/INITIATED call older than 18 hours (priority stuck-call fix)
+//
+// NC retry campaign rows (NOTCONNECTED_* request IDs) are skipped — they are
+// handled by processNotConnectedAutoRetry separately.
+// ─────────────────────────────────────────────────────────────────────────────
+async function dedicatedNcAndCompletedSweep() {
+  console.log('[nc-sweep] Starting dedicated NC + Completed sweep…');
+  const STUCK_THRESHOLD_MS = 18 * 60 * 60 * 1000; // 18 hours
+  const now = Date.now();
+
+  const agents = (await getAllAgents()).filter(a => a.active && a.spreadsheetId);
+
+  for (const agent of agents) {
+    try {
+      const ssId   = agent.spreadsheetId;
+      const mtName = AGT.MASTER_TRACKER;
+      const { headers, rows } = await readSheet(ssId, mtName);
+      if (!headers.length || !rows.length) continue;
+
+      const ciIdx  = headers.indexOf('Call ID');
+      const siIdx  = headers.indexOf('Status');
+      const riIdx  = headers.indexOf('Request ID');
+      const caIdx  = headers.indexOf('Created At');
+      const diIdx  = headers.indexOf('Duration (Minutes)');
+      if (ciIdx < 0 || siIdx < 0) continue;
+
+      const resultFields = resultFieldNames(agent.resultSchema);
+      const customVars   = agent.customVariables || [];
+
+      // Bucket 1: NOT_CONNECTED (skip NOTCONNECTED_* retries)
+      const ncRows = [];
+      // Bucket 2: COMPLETED missing output
+      const backfillRows = [];
+      // Bucket 3: SCHEDULED/INITIATED stuck > 18h (priority)
+      const stuckRows = [];
+
+      rows.forEach((row, i) => {
+        const status  = String(row[siIdx] || '').toUpperCase();
+        const callId  = String(row[ciIdx] || '').trim();
+        const reqId   = riIdx >= 0 ? String(row[riIdx] || '') : '';
+        if (!callId) return;
+        if (isNcRetryReqId(reqId)) return; // skip auto-retry campaigns
+
+        if (status === 'NOT_CONNECTED') {
+          const createdAt = caIdx >= 0 && row[caIdx] ? new Date(row[caIdx]).getTime() : 0;
+          ncRows.push({ rowIndex: i + 2, row, callId, createdAt });
+          return;
+        }
+        if (status === 'COMPLETED') {
+          const hasOutput = resultFields.length === 0 || resultFields.some(f => {
+            const col = headers.indexOf('out.' + f);
+            return col >= 0 && String(row[col] || '').trim() !== '';
+          });
+          if (!hasOutput) backfillRows.push({ rowIndex: i + 2, row, callId });
+          return;
+        }
+        if (status === 'SCHEDULED' || status === 'INITIATED' || status === 'IN_PROGRESS') {
+          const createdAt = caIdx >= 0 && row[caIdx] ? new Date(row[caIdx]).getTime() : 0;
+          if (createdAt && (now - createdAt) > STUCK_THRESHOLD_MS) {
+            stuckRows.push({ rowIndex: i + 2, row, callId, createdAt });
+          }
+        }
+      });
+
+      // Sort NC oldest-first
+      ncRows.sort((a, b) => a.createdAt - b.createdAt);
+      // Sort stuck oldest-first (highest priority)
+      stuckRows.sort((a, b) => a.createdAt - b.createdAt);
+
+      // Process order: stuck first, then NC, then backfill
+      const toProcess = [...stuckRows, ...ncRows, ...backfillRows].slice(0, 50); // cap per agent
+      if (!toProcess.length) continue;
+
+      console.log(`[nc-sweep] ${agent.agentCode}: stuck=${stuckRows.length} nc=${ncRows.length} backfill=${backfillRows.length}`);
+
+      const rowUpdates = [];
+      for (const item of toProcess) {
+        const res = await getCall(item.callId);
+        if (!res.ok) { await sleep(200); continue; }
+        const d      = res.data;
+        const result = d.result || {};
+        const newRow = [...item.row];
+        const setH   = (name, val) => { const k = headers.indexOf(name); if (k >= 0) newRow[k] = val; };
+        setH('Status',             String(d.status || item.row[siIdx] || '').toUpperCase());
+        setH('Duration (Minutes)', d.duration_minutes ?? 0);
+        setH('Duration (Seconds)', d.duration_seconds ?? 0);
+        setH('Started At',         d.started_at || '');
+        setH('Ended At',           d.ended_at || '');
+        setH('Answered By',        d.answered_by || '');
+        setH('Engagement Status',  d.engagement_status || '');
+        setH('Call Ended By',      d.call_ended_by || '');
+        setH('Recording URL',      d.recording_url || '');
+        setH('Updated At',         new Date().toISOString());
+        customVars.forEach(cv => { if (d.custom_data?.[cv] !== undefined) setH('in.' + cv, d.custom_data[cv]); });
+        resultFields.forEach(f  => { setH('out.' + f, result[f] !== undefined ? result[f] : ''); });
+        rowUpdates.push({ rowIndex: item.rowIndex, values: newRow });
+        await sleep(150);
+      }
+
+      if (rowUpdates.length) {
+        for (let i = 0; i < rowUpdates.length; i += 50) {
+          await batchWriteRows(ssId, mtName, rowUpdates.slice(i, i + 50));
+          if (i + 50 < rowUpdates.length) await sleep(400);
+        }
+        console.log(`[nc-sweep] ${agent.agentCode}: updated ${rowUpdates.length} rows`);
+      }
+      await sleep(1000);
+    } catch (err) {
+      console.error(`[nc-sweep] Error on ${agent.agentCode}:`, err.message);
+    }
+  }
+  console.log('[nc-sweep] Done.');
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // JOB 1: POLL ACTIVE BATCHES
 // Fetches call statuses from Hunar API, updates Master Tracker,
@@ -2786,8 +2911,17 @@ async function startPoller() {
     try { await processNotConnectedAutoRetry(); } catch (e) { console.error('[cron:nc-retry]', e.message); }
   });
 
-  // 9pm IST = 15:30 UTC — end of day sweep, all active campaigns fully updated
+  // 1pm IST = 07:30 UTC — dedicated NC + completed sweep (first run of day)
+  cron.schedule('30 7 * * *', { timezone: IST_TZ }, async () => {
+    console.log('[cron:nc-sweep-1pm] Starting 1pm IST NC + Completed sweep…');
+    try { await dedicatedNcAndCompletedSweep(); } catch (e) { console.error('[cron:nc-sweep-1pm]', e.message); }
+  });
+
+  // 9pm IST = 15:30 UTC — dedicated NC + completed sweep (second run of day)
+  // NOTE: this replaces the old eodSweep-only cron at 15:30; both now run together
 cron.schedule('30 15 * * *', async () => {
+    try { await dedicatedNcAndCompletedSweep(); } catch (e) { console.error('[cron:nc-sweep-9pm]', e.message); }
+    await sleep(60_000); // wait 1 min for NC sweep writes to settle
     try { await eodSweep(); } catch (e) { console.error('[cron:eod]', e.message); }
     try { await syncNotConnectedFromMT(); } catch (e) { console.error('[cron:nc-sync]', e.message); }
     await sleep(120_000); // wait 2 min for eodSweep writes to settle
@@ -2802,12 +2936,21 @@ cron.schedule('30 15 * * *', async () => {
     } catch (e) { console.error('[cron:eod-cache]', e.message); }
   });
 
-  // Sunday 9pm IST = Sunday 15:30 UTC — weekly MT archive
-  cron.schedule('30 15 * * 0', async () => {
-    try {
-      console.log('[cron:archive] Running weekly MT archive…');
-      await archiveCompletedCampaignMT();
-    } catch(e) { console.error('[cron:archive]', e.message); }
+  // Mon/Wed/Sat 3am IST = Mon/Wed/Sat 21:30 UTC (previous day)
+  // Monday:    cron day 1 → UTC Sunday  21:30 → '30 21 * * 0'
+  // Wednesday: cron day 3 → UTC Tuesday 21:30 → '30 21 * * 2'
+  // Saturday:  cron day 6 → UTC Friday  21:30 → '30 21 * * 5'
+  cron.schedule('30 21 * * 0', async () => {
+    try { console.log('[cron:archive-mon] Running Monday MT archive…'); await archiveCompletedCampaignMT(); }
+    catch(e) { console.error('[cron:archive-mon]', e.message); }
+  });
+  cron.schedule('30 21 * * 2', async () => {
+    try { console.log('[cron:archive-wed] Running Wednesday MT archive…'); await archiveCompletedCampaignMT(); }
+    catch(e) { console.error('[cron:archive-wed]', e.message); }
+  });
+  cron.schedule('30 21 * * 5', async () => {
+    try { console.log('[cron:archive-sat] Running Saturday MT archive…'); await archiveCompletedCampaignMT(); }
+    catch(e) { console.error('[cron:archive-sat]', e.message); }
   });
 
   // Delay startup poll by 3 min — lets the server handle user traffic first
@@ -2851,6 +2994,7 @@ module.exports = {
   processCallbackQueue,
   processRetryQueue,
   processNotConnectedAutoRetry,
+  dedicatedNcAndCompletedSweep,
   eodSweep,
   getArchivedLeads,
   getArchivedMT,

@@ -1802,6 +1802,7 @@ function UploadView({ user, agents, refreshMe }) {
   const [rows,setRows]=useState([]); const [mapping,setMapping]=useState({});
   const [busy,setBusy]=useState(false); const [result,setResult]=useState(null); const [err,setErr]=useState("");
   const [dragging,setDragging]=useState(false);
+  const [showTestCall,setShowTestCall]=useState(false);
   const fileRef=useRef(null);
   const agent=agents.find(a=>a.agentCode===selAgent);
   const required=useMemo(()=>agent?["callee_name","mobile_number"].concat(agent.customVariables||[]):[],[agent]);
@@ -1876,6 +1877,15 @@ function UploadView({ user, agents, refreshMe }) {
                     <span className="t-pill t-pill-blue">mobile_number</span>
                     {(agent.customVariables||[]).map(v=><span key={v} className="t-pill t-pill-gray">{v}</span>)}
                   </div>
+                  <div style={{marginTop:10,paddingTop:10,borderTop:"1px solid #f0f0f0"}}>
+                    <button
+                      onClick={()=>setShowTestCall(true)}
+                      className="t-btn t-btn-outline t-btn-sm"
+                      style={{fontSize:10,color:"#6739b7",borderColor:"#c4b5fd",background:"#f5f3ff"}}
+                    >
+                      🧪 Test Call (single contact)
+                    </button>
+                  </div>
                 </div>
               )}
             </div>
@@ -1937,6 +1947,7 @@ function UploadView({ user, agents, refreshMe }) {
           )}
         </div>
       )}
+      {showTestCall && agent && <TestCallModal agent={agent} onClose={()=>setShowTestCall(false)}/>}
     </div>
   );
 }
@@ -3179,6 +3190,222 @@ function TLAddByIdView({ onBack, onAdd, saving, msg, addedAgent }) {
   );
 }
 
+// ─────────────────────────────────────────────────────────────
+// RESULT VALUES EDITOR — Table view + JSON Schema toggle
+// ─────────────────────────────────────────────────────────────
+function ResultValuesEditor({ form, setForm, addRF, updateRF, removeRF }) {
+  const [viewMode, setViewMode] = useState("table"); // "table" | "json"
+  const [jsonText, setJsonText] = useState("");
+  const [jsonErr, setJsonErr] = useState("");
+
+  // Build JSON schema from current result fields
+  function fieldsToJsonSchema(fields) {
+    const properties = {};
+    fields.filter(f => f.name.trim()).forEach(f => {
+      properties[f.name.trim()] = {
+        type: "string",
+        description: f.expected.trim() || "",
+      };
+    });
+    return JSON.stringify({ type: "object", properties }, null, 2);
+  }
+
+  // Parse JSON schema back into result fields
+  function jsonSchemaToFields(text) {
+    const parsed = JSON.parse(text);
+    const props = parsed.properties || parsed;
+    return Object.entries(props)
+      .filter(([k]) => k !== "type" && k !== "required")
+      .map(([name, val]) => ({
+        name,
+        expected: typeof val === "object" ? (val.description || val.enum?.join(" / ") || "") : String(val || ""),
+      }));
+  }
+
+  function switchToJson() {
+    setJsonText(fieldsToJsonSchema(form.resultFields));
+    setJsonErr("");
+    setViewMode("json");
+  }
+
+  function applyJson() {
+    try {
+      const fields = jsonSchemaToFields(jsonText);
+      if (!fields.length) { setJsonErr("No valid fields found in schema."); return; }
+      setForm(f => ({ ...f, resultFields: fields }));
+      setJsonErr("");
+      setViewMode("table");
+    } catch (e) {
+      setJsonErr("Invalid JSON: " + e.message);
+    }
+  }
+
+  function switchToTable() {
+    // Try apply first — if parse fails, warn but don't block
+    try {
+      if (jsonText.trim()) {
+        const fields = jsonSchemaToFields(jsonText);
+        if (fields.length) setForm(f => ({ ...f, resultFields: fields }));
+      }
+    } catch (_) {}
+    setViewMode("table");
+    setJsonErr("");
+  }
+
+  return (
+    <div style={{marginBottom:20}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
+        <label className="t-label" style={{marginBottom:0}}>Result Values <span style={{color:"var(--red)"}}>*</span></label>
+        <div style={{marginLeft:"auto",display:"flex",background:"#f0f0f0",border:"1.5px solid var(--border)",borderRadius:4,overflow:"hidden"}}>
+          <button
+            onClick={()=>viewMode==="json"?switchToTable():null}
+            style={{padding:"3px 12px",fontSize:9,fontFamily:"var(--fd)",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase",border:"none",cursor:"pointer",background:viewMode==="table"?"var(--black)":"#f0f0f0",color:viewMode==="table"?"#fff":"var(--muted)",transition:"all .12s"}}
+          >Table view</button>
+          <button
+            onClick={()=>viewMode==="table"?switchToJson():null}
+            style={{padding:"3px 12px",fontSize:9,fontFamily:"var(--fd)",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase",border:"none",cursor:"pointer",background:viewMode==="json"?"var(--black)":"#f0f0f0",color:viewMode==="json"?"#fff":"var(--muted)",transition:"all .12s"}}
+          >JSON view</button>
+        </div>
+      </div>
+
+      {viewMode === "table" && (
+        <>
+          <div style={{border:"1.5px solid var(--black)",overflow:"hidden",marginBottom:8}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+              <thead>
+                <tr style={{background:"var(--black)"}}>
+                  <th style={{padding:"7px 10px",color:"#fff",fontFamily:"var(--fd)",fontWeight:700,fontSize:9,letterSpacing:".12em",textAlign:"left",width:32}}>No</th>
+                  <th style={{padding:"7px 10px",color:"#fff",fontFamily:"var(--fd)",fontWeight:700,fontSize:9,letterSpacing:".12em",textAlign:"left"}}>Field Name</th>
+                  <th style={{padding:"7px 10px",color:"#fff",fontFamily:"var(--fd)",fontWeight:700,fontSize:9,letterSpacing:".12em",textAlign:"left"}}>Expected Values / Description</th>
+                  <th style={{width:30}}/>
+                </tr>
+              </thead>
+              <tbody>
+                {form.resultFields.map((rf,i)=>(
+                  <tr key={i} style={{borderBottom:"1px solid #eee"}}>
+                    <td style={{padding:"4px 10px",color:"var(--muted)",fontFamily:"var(--fm)"}}>{i+1}.</td>
+                    <td style={{padding:"3px 6px"}}><input className="t-input" style={{fontSize:11,padding:"5px 7px",border:"1px solid #eee"}} placeholder="e.g. interestStatus" value={rf.name} onChange={e=>updateRF(i,"name",e.target.value)}/></td>
+                    <td style={{padding:"3px 6px"}}><input className="t-input" style={{fontSize:11,padding:"5px 7px",border:"1px solid #eee"}} placeholder="e.g. INTERESTED / NOT_INTERESTED / UNSURE" value={rf.expected} onChange={e=>updateRF(i,"expected",e.target.value)}/></td>
+                    <td style={{padding:"3px 6px",textAlign:"center"}}><button onClick={()=>removeRF(i)} style={{background:"none",border:"none",cursor:"pointer",color:"var(--muted)",fontSize:14}}>×</button></td>
+                  </tr>
+                ))}
+                {form.resultFields.length === 0 && (
+                  <tr><td colSpan={4} style={{padding:"18px 12px",textAlign:"center",color:"var(--muted)",fontSize:11,fontStyle:"italic"}}>No fields yet. Click "+ Add Field" below.</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+          <button className="t-btn t-btn-outline t-btn-sm" onClick={addRF}>+ Add Field</button>
+        </>
+      )}
+
+      {viewMode === "json" && (
+        <>
+          <div style={{fontSize:11,color:"var(--muted)",marginBottom:6,lineHeight:1.5}}>
+            Edit the JSON Schema directly. Each key under <code style={{fontFamily:"var(--fm)",background:"#f0f0f0",padding:"1px 4px"}}>properties</code> becomes a result field. Use <code style={{fontFamily:"var(--fm)",background:"#f0f0f0",padding:"1px 4px"}}>description</code> for expected values.
+          </div>
+          <textarea
+            value={jsonText}
+            onChange={e=>{setJsonText(e.target.value);setJsonErr("");}}
+            spellCheck={false}
+            rows={18}
+            style={{width:"100%",fontFamily:"var(--fm)",fontSize:11,padding:"10px 12px",border:"1.5px solid "+(jsonErr?"var(--red)":"var(--black)"),background:"#0a0a0a",color:"#e2e8f0",borderRadius:2,resize:"vertical",lineHeight:1.7,outline:"none"}}
+          />
+          {jsonErr && <div style={{color:"var(--red)",fontSize:11,marginTop:4,fontFamily:"var(--fm)"}}>{jsonErr}</div>}
+          <div style={{marginTop:8,display:"flex",gap:8}}>
+            <button className="t-btn t-btn-black t-btn-sm" onClick={applyJson}>Apply JSON → Table</button>
+            <button className="t-btn t-btn-outline t-btn-sm" onClick={switchToTable}>← Back to Table</button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// TEST CALL MODAL — trigger a single test call for an agent
+// ─────────────────────────────────────────────────────────────
+function TestCallModal({ agent, onClose }) {
+  const [name, setName]     = useState("");
+  const [mobile, setMobile] = useState("");
+  const [busy, setBusy]     = useState(false);
+  const [result, setResult] = useState(null);
+  const [err, setErr]       = useState("");
+
+  async function submit() {
+    const mob = mobile.replace(/[^\d]/g, "");
+    if (!name.trim())     { setErr("Enter a name."); return; }
+    if (mob.length < 10)  { setErr("Enter a valid 10-digit mobile number."); return; }
+    setBusy(true); setErr("");
+    const r = await api("testcall", {
+      agentCode: agent.agentCode,
+      callee_name: name.trim(),
+      mobile_number: mobile.trim(),
+    });
+    setBusy(false);
+    if (!r.ok) { setErr(r.message || r.error || "Failed to trigger test call."); return; }
+    setResult(r);
+  }
+
+  return (
+    <div className="t-modal-bg" onClick={e=>{ if(e.target===e.currentTarget) onClose(); }}>
+      <div className="t-modal t-fade" style={{maxWidth:440}}>
+        <div className="t-modal-hd">
+          <span style={{textTransform:"none",letterSpacing:0,fontSize:15}}>
+            🧪 Test Call — {agent.displayName}
+          </span>
+          <button onClick={onClose} style={{background:"none",border:"none",color:"rgba(255,255,255,.6)",cursor:"pointer",fontSize:20,lineHeight:1}}>×</button>
+        </div>
+        <div className="t-modal-body" style={{display:"flex",flexDirection:"column",gap:14}}>
+          {!result ? (
+            <>
+              <div style={{background:"#fffbe6",border:"1px solid var(--yellow)",padding:"8px 12px",fontSize:11,color:"#5a4a00",lineHeight:1.5,borderRadius:2}}>
+                This triggers a <b>real call</b> to the number below using <b>{agent.displayName}</b>. Use a test number only.
+              </div>
+              <div>
+                <label className="t-label">Callee Name <span style={{color:"var(--red)"}}>*</span></label>
+                <input className="t-input" autoFocus value={name} onChange={e=>setName(e.target.value)} placeholder="e.g. Test User" maxLength={80}/>
+              </div>
+              <div>
+                <label className="t-label">Mobile Number <span style={{color:"var(--red)"}}>*</span></label>
+                <input className="t-input" type="tel" value={mobile} onChange={e=>setMobile(e.target.value)} placeholder="e.g. 9876543210" maxLength={15}/>
+                <div style={{fontSize:10,color:"var(--muted)",marginTop:3,fontFamily:"var(--fm)"}}>10 digits, no country code needed</div>
+              </div>
+              {err && <div className="t-alert t-alert-err">{err}</div>}
+            </>
+          ) : (
+            <div style={{display:"flex",flexDirection:"column",gap:10}}>
+              <div style={{background:"#f0fff7",border:"1.5px solid #6ee7b7",padding:"14px 16px",borderRadius:3}}>
+                <div style={{fontFamily:"var(--fd)",fontWeight:900,fontSize:14,color:"var(--green)",marginBottom:6}}>✓ Test Call Triggered!</div>
+                <div style={{fontSize:12,lineHeight:1.7,color:"#065f46"}}>
+                  <div><b>Agent:</b> {agent.displayName}</div>
+                  <div><b>Name:</b> {result.calleeName}</div>
+                  <div><b>Mobile:</b> {result.mobileNumber}</div>
+                  <div style={{marginTop:6,fontFamily:"var(--fm)",fontSize:10,color:"#065f46"}}>
+                    Request ID: {result.requestId}
+                    {result.callId && <><br/>Call ID: {result.callId}</>}
+                  </div>
+                </div>
+              </div>
+              <div style={{fontSize:11,color:"var(--muted)",lineHeight:1.5}}>
+                The call will appear in the Campaigns view under request <b>{result.requestId?.slice(-12)}</b>. Results update every 5 minutes.
+              </div>
+            </div>
+          )}
+        </div>
+        <div className="t-modal-footer">
+          <button onClick={onClose} className="t-btn t-btn-outline">{result ? "Close" : "Cancel"}</button>
+          {!result && (
+            <button onClick={submit} disabled={busy || !name.trim() || mobile.replace(/[^\d]/g,"").length < 10} className="t-btn t-btn-black">
+              {busy ? <Spin white/> : "📞 Trigger Test Call"}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Full agent wizard for TL/IC ──
 function TLAgentWizard({ user, editAgent, onSave, onBack, saving, msg, setMsg }) {
   const [step, setStep] = useState(1);
@@ -3286,25 +3513,7 @@ function TLAgentWizard({ user, editAgent, onSave, onBack, saving, msg, setMsg })
           <div style={{display:"flex",flex:1}}>
             <div style={{flex:1,padding:"28px 32px",overflowY:"auto"}}>
               <h2 style={{fontFamily:"var(--fd)",fontWeight:900,fontSize:20,marginBottom:24}}>Result Agent Set Up</h2>
-              <div style={{marginBottom:20}}>
-                <label className="t-label" style={{marginBottom:8}}>Result Values <span style={{color:"var(--red)"}}>*</span></label>
-                <div style={{border:"1.5px solid var(--black)",overflow:"hidden",marginBottom:8}}>
-                  <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-                    <thead><tr style={{background:"var(--black)"}}><th style={{padding:"7px 10px",color:"#fff",fontFamily:"var(--fd)",fontWeight:700,fontSize:9,letterSpacing:".12em",textAlign:"left",width:32}}>No</th><th style={{padding:"7px 10px",color:"#fff",fontFamily:"var(--fd)",fontWeight:700,fontSize:9,letterSpacing:".12em",textAlign:"left"}}>Column Name</th><th style={{padding:"7px 10px",color:"#fff",fontFamily:"var(--fd)",fontWeight:700,fontSize:9,letterSpacing:".12em",textAlign:"left"}}>Expected Values</th><th style={{width:30}}/></tr></thead>
-                    <tbody>
-                      {form.resultFields.map((rf,i)=>(
-                        <tr key={i} style={{borderBottom:"1px solid #eee"}}>
-                          <td style={{padding:"4px 10px",color:"var(--muted)",fontFamily:"var(--fm)"}}>{i+1}.</td>
-                          <td style={{padding:"3px 6px"}}><input className="t-input" style={{fontSize:11,padding:"5px 7px",border:"1px solid #eee"}} placeholder="e.g. interested" value={rf.name} onChange={e=>updateRF(i,"name",e.target.value)}/></td>
-                          <td style={{padding:"3px 6px"}}><input className="t-input" style={{fontSize:11,padding:"5px 7px",border:"1px solid #eee"}} placeholder="e.g. Yes / No" value={rf.expected} onChange={e=>updateRF(i,"expected",e.target.value)}/></td>
-                          <td style={{padding:"3px 6px",textAlign:"center"}}><button onClick={()=>removeRF(i)} style={{background:"none",border:"none",cursor:"pointer",color:"var(--muted)",fontSize:14}}>×</button></td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-                <button className="t-btn t-btn-outline t-btn-sm" onClick={addRF}>+ Add More</button>
-              </div>
+              <ResultValuesEditor form={form} setForm={setForm} addRF={addRF} updateRF={updateRF} removeRF={removeRF}/>
               <div style={{marginBottom:20}}>
                 <label className="t-label" style={{marginBottom:5}}>Result Prompt <span style={{color:"var(--red)"}}>*</span></label>
                 <textarea className="t-input" rows={10} style={{fontSize:11,fontFamily:"var(--fm)",resize:"vertical",lineHeight:1.6}} placeholder={"Evaluate the call and extract key information."} value={form.resultPrompt} onChange={e=>setForm({...form,resultPrompt:e.target.value})}/>
