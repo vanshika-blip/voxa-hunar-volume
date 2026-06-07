@@ -2912,7 +2912,7 @@ async function startPoller() {
   });
 
   // 1pm IST = 07:30 UTC — dedicated NC + completed sweep (first run of day)
-  cron.schedule('30 7 * * *', { timezone: IST_TZ }, async () => {
+  cron.schedule('30 7 * * *', async () => {
     console.log('[cron:nc-sweep-1pm] Starting 1pm IST NC + Completed sweep…');
     try { await dedicatedNcAndCompletedSweep(); } catch (e) { console.error('[cron:nc-sweep-1pm]', e.message); }
   });
