@@ -551,57 +551,90 @@ function isNcRetryReqId(reqId) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DEDICATED NC + COMPLETED SWEEP (runs at 1pm and 9pm IST)
+// DEDICATED IN-PROGRESS CAMPAIGN SWEEP (runs at 1pm and 9pm IST)
 //
-// Order of operations per agent:
-//   1. NOT_CONNECTED rows — oldest Created At first
-//   2. COMPLETED rows missing out.* data (backfill)
-//   3. Any SCHEDULED/INITIATED call older than 18 hours (priority stuck-call fix)
+// For every campaign that is IN_PROGRESS in Campaign_Tracker:
+//   1. Fetch status of ALL calls (INITIATED/IN_PROGRESS/SCHEDULED) — no cap
+//   2. Backfill COMPLETED rows missing out.* data
+//   3. Mark INITIATED/IN_PROGRESS calls older than 18h as NOT_CONNECTED (stale close)
+//   4. Refresh Campaign_Tracker stats after all writes
 //
-// NC retry campaign rows (NOTCONNECTED_* request IDs) are skipped — they are
-// handled by processNotConnectedAutoRetry separately.
+// NC retry campaigns (NOTCONNECTED_* request IDs) are skipped here —
+// they are handled by processNotConnectedAutoRetry separately.
 // ─────────────────────────────────────────────────────────────────────────────
 async function dedicatedNcAndCompletedSweep() {
-  console.log('[nc-sweep] Starting dedicated NC + Completed sweep…');
   const STUCK_THRESHOLD_MS = 18 * 60 * 60 * 1000; // 18 hours
   const now = Date.now();
+  console.log('[ip-sweep] Starting IN_PROGRESS campaign sweep (1pm / 9pm)…');
 
   const agents = (await getAllAgents()).filter(a => a.active && a.spreadsheetId);
+  let totalAgents = 0, totalFetched = 0, totalUpdated = 0, totalClosed = 0;
 
   for (const agent of agents) {
     try {
       const ssId   = agent.spreadsheetId;
       const mtName = AGT.MASTER_TRACKER;
+      const ctName = AGT.CAMPAIGN_TRACKER;
+
+      // ── Step 1: Find all IN_PROGRESS campaigns in Campaign_Tracker ──────────
+      const { headers: ctH, rows: ctRows } = await readSheet(ssId, ctName).catch(() => ({ headers: [], rows: [] }));
+      const ctReqCol    = ctH.indexOf('Request ID');
+      const ctStatusCol = ctH.indexOf('Status');
+      const ctRowByReq  = new Map(); // reqId → { rowIndex, row }
+
+      const inProgressReqIds = new Set();
+      if (ctReqCol >= 0 && ctStatusCol >= 0) {
+        ctRows.forEach((r, i) => {
+          const rid = String(r[ctReqCol] || '').trim();
+          const st  = String(r[ctStatusCol] || '').toUpperCase();
+          if (!rid) return;
+          ctRowByReq.set(rid, { rowIndex: i + 2, row: r });
+          if (st !== 'COMPLETED' && st !== 'FAILED' && !isNcRetryReqId(rid)) {
+            inProgressReqIds.add(rid);
+          }
+        });
+      }
+
+      if (!inProgressReqIds.size) continue;
+      totalAgents++;
+
+      // ── Step 2: Read Master Tracker ─────────────────────────────────────────
       const { headers, rows } = await readSheet(ssId, mtName);
       if (!headers.length || !rows.length) continue;
 
-      const ciIdx  = headers.indexOf('Call ID');
-      const siIdx  = headers.indexOf('Status');
-      const riIdx  = headers.indexOf('Request ID');
-      const caIdx  = headers.indexOf('Created At');
-      const diIdx  = headers.indexOf('Duration (Minutes)');
+      const ciIdx = headers.indexOf('Call ID');
+      const siIdx = headers.indexOf('Status');
+      const riIdx = headers.indexOf('Request ID');
+      const caIdx = headers.indexOf('Created At');
       if (ciIdx < 0 || siIdx < 0) continue;
 
       const resultFields = resultFieldNames(agent.resultSchema);
       const customVars   = agent.customVariables || [];
 
-      // Bucket 1: NOT_CONNECTED (skip NOTCONNECTED_* retries)
-      const ncRows = [];
-      // Bucket 2: COMPLETED missing output
-      const backfillRows = [];
-      // Bucket 3: SCHEDULED/INITIATED stuck > 18h (priority)
-      const stuckRows = [];
+      // Buckets — process every row in IN_PROGRESS campaigns, NO CAP
+      const liveRows      = []; // INITIATED / IN_PROGRESS / SCHEDULED / NOT_STARTED
+      const backfillRows  = []; // COMPLETED missing out.*
+      const staleRows     = []; // INITIATED/IN_PROGRESS older than 18h → force close
 
       rows.forEach((row, i) => {
-        const status  = String(row[siIdx] || '').toUpperCase();
-        const callId  = String(row[ciIdx] || '').trim();
-        const reqId   = riIdx >= 0 ? String(row[riIdx] || '') : '';
-        if (!callId) return;
-        if (isNcRetryReqId(reqId)) return; // skip auto-retry campaigns
+        const callId = String(row[ciIdx] || '').trim();
+        const reqId  = riIdx >= 0 ? String(row[riIdx] || '').trim() : '';
+        const status = String(row[siIdx] || '').toUpperCase();
+        if (!callId || !inProgressReqIds.has(reqId)) return;
 
-        if (status === 'NOT_CONNECTED') {
-          const createdAt = caIdx >= 0 && row[caIdx] ? new Date(row[caIdx]).getTime() : 0;
-          ncRows.push({ rowIndex: i + 2, row, callId, createdAt });
+        const createdAt = caIdx >= 0 && row[caIdx] ? new Date(row[caIdx]).getTime() : 0;
+        const isStale   = createdAt && (now - createdAt) > STUCK_THRESHOLD_MS;
+
+        if (status === 'INITIATED' || status === 'IN_PROGRESS' || status === 'RINGING' || status === 'NOT_STARTED') {
+          if (isStale) {
+            staleRows.push({ rowIndex: i + 2, row, callId, reqId, createdAt });
+          } else {
+            liveRows.push({ rowIndex: i + 2, row, callId, reqId });
+          }
+          return;
+        }
+        if (status === 'SCHEDULED') {
+          liveRows.push({ rowIndex: i + 2, row, callId, reqId });
           return;
         }
         if (status === 'COMPLETED') {
@@ -609,32 +642,62 @@ async function dedicatedNcAndCompletedSweep() {
             const col = headers.indexOf('out.' + f);
             return col >= 0 && String(row[col] || '').trim() !== '';
           });
-          if (!hasOutput) backfillRows.push({ rowIndex: i + 2, row, callId });
-          return;
+          if (!hasOutput) backfillRows.push({ rowIndex: i + 2, row, callId, reqId });
         }
-        if (status === 'SCHEDULED' || status === 'INITIATED' || status === 'IN_PROGRESS') {
-          const createdAt = caIdx >= 0 && row[caIdx] ? new Date(row[caIdx]).getTime() : 0;
-          if (createdAt && (now - createdAt) > STUCK_THRESHOLD_MS) {
-            stuckRows.push({ rowIndex: i + 2, row, callId, createdAt });
-          }
-        }
+        // NOT_CONNECTED / FAILED / CANCELLED are terminal — skip
       });
 
-      // Sort NC oldest-first
-      ncRows.sort((a, b) => a.createdAt - b.createdAt);
-      // Sort stuck oldest-first (highest priority)
-      stuckRows.sort((a, b) => a.createdAt - b.createdAt);
+      const agentTodo = liveRows.length + backfillRows.length + staleRows.length;
+      if (!agentTodo && !staleRows.length) continue;
 
-      // Process order: stuck first, then NC, then backfill
-      const toProcess = [...stuckRows, ...ncRows, ...backfillRows].slice(0, 50); // cap per agent
-      if (!toProcess.length) continue;
-
-      console.log(`[nc-sweep] ${agent.agentCode}: stuck=${stuckRows.length} nc=${ncRows.length} backfill=${backfillRows.length}`);
+      console.log(`[ip-sweep] ${agent.agentCode}: inProgress=${inProgressReqIds.size} live=${liveRows.length} backfill=${backfillRows.length} stale=${staleRows.length}`);
 
       const rowUpdates = [];
-      for (const item of toProcess) {
+
+      // ── Step 3: Force-close stale rows locally (no API call needed) ─────────
+      for (const item of staleRows) {
+        const newRow = [...item.row];
+        const setH   = (name, val) => { const k = headers.indexOf(name); if (k >= 0) newRow[k] = val; };
+        // Try to get real status from Hunar first
+        try {
+          const res = await getCall(item.callId);
+          await sleep(120);
+          if (res.ok) {
+            const d      = res.data;
+            const ns     = String(d.status || '').toUpperCase();
+            const result = d.result || {};
+            setH('Status',             ns || 'NOT_CONNECTED');
+            setH('Duration (Minutes)', d.duration_minutes ?? 0);
+            setH('Duration (Seconds)', d.duration_seconds ?? 0);
+            setH('Started At',         d.started_at || '');
+            setH('Ended At',           d.ended_at   || '');
+            setH('Answered By',        d.answered_by || '');
+            setH('Engagement Status',  d.engagement_status || '');
+            setH('Call Ended By',      d.call_ended_by || '');
+            setH('Recording URL',      d.recording_url || '');
+            setH('Updated At',         new Date().toISOString());
+            customVars.forEach(cv => { if (d.custom_data?.[cv] !== undefined) setH('in.' + cv, d.custom_data[cv]); });
+            resultFields.forEach(f  => { setH('out.' + f, result[f] !== undefined ? result[f] : ''); });
+            totalFetched++;
+          } else {
+            // API failed — mark as NOT_CONNECTED so campaign can complete
+            setH('Status',     'NOT_CONNECTED');
+            setH('Updated At', new Date().toISOString());
+          }
+        } catch (_) {
+          setH('Status',     'NOT_CONNECTED');
+          setH('Updated At', new Date().toISOString());
+        }
+        rowUpdates.push({ rowIndex: item.rowIndex, values: newRow });
+        totalClosed++;
+      }
+
+      // ── Step 4: Fetch live calls (all of them — no cap) ─────────────────────
+      for (const item of liveRows) {
         const res = await getCall(item.callId);
-        if (!res.ok) { await sleep(200); continue; }
+        totalFetched++;
+        await sleep(120);
+        if (!res.ok) continue;
         const d      = res.data;
         const result = d.result || {};
         const newRow = [...item.row];
@@ -643,7 +706,7 @@ async function dedicatedNcAndCompletedSweep() {
         setH('Duration (Minutes)', d.duration_minutes ?? 0);
         setH('Duration (Seconds)', d.duration_seconds ?? 0);
         setH('Started At',         d.started_at || '');
-        setH('Ended At',           d.ended_at || '');
+        setH('Ended At',           d.ended_at   || '');
         setH('Answered By',        d.answered_by || '');
         setH('Engagement Status',  d.engagement_status || '');
         setH('Call Ended By',      d.call_ended_by || '');
@@ -652,23 +715,117 @@ async function dedicatedNcAndCompletedSweep() {
         customVars.forEach(cv => { if (d.custom_data?.[cv] !== undefined) setH('in.' + cv, d.custom_data[cv]); });
         resultFields.forEach(f  => { setH('out.' + f, result[f] !== undefined ? result[f] : ''); });
         rowUpdates.push({ rowIndex: item.rowIndex, values: newRow });
-        await sleep(150);
+        totalUpdated++;
       }
 
-      if (rowUpdates.length) {
-        for (let i = 0; i < rowUpdates.length; i += 50) {
-          await batchWriteRows(ssId, mtName, rowUpdates.slice(i, i + 50));
-          if (i + 50 < rowUpdates.length) await sleep(400);
-        }
-        console.log(`[nc-sweep] ${agent.agentCode}: updated ${rowUpdates.length} rows`);
+      // ── Step 5: Backfill COMPLETED rows missing eval data ────────────────────
+      for (const item of backfillRows) {
+        const res = await getCall(item.callId);
+        totalFetched++;
+        await sleep(120);
+        if (!res.ok) continue;
+        const d      = res.data;
+        const result = d.result || {};
+        const newRow = [...item.row];
+        const setH   = (name, val) => { const k = headers.indexOf(name); if (k >= 0) newRow[k] = val; };
+        setH('Duration (Minutes)', d.duration_minutes ?? 0);
+        setH('Duration (Seconds)', d.duration_seconds ?? 0);
+        setH('Started At',         d.started_at || '');
+        setH('Ended At',           d.ended_at   || '');
+        setH('Answered By',        d.answered_by || '');
+        setH('Engagement Status',  d.engagement_status || '');
+        setH('Call Ended By',      d.call_ended_by || '');
+        setH('Recording URL',      d.recording_url || '');
+        setH('Updated At',         new Date().toISOString());
+        customVars.forEach(cv => { if (d.custom_data?.[cv] !== undefined) setH('in.' + cv, d.custom_data[cv]); });
+        resultFields.forEach(f  => { setH('out.' + f, result[f] !== undefined ? result[f] : ''); });
+        rowUpdates.push({ rowIndex: item.rowIndex, values: newRow });
+        totalUpdated++;
       }
-      await sleep(1000);
+
+      // ── Step 6: Batch-write all updates ──────────────────────────────────────
+      if (rowUpdates.length) {
+        for (let i = 0; i < rowUpdates.length; i += 100) {
+          await batchWriteRows(ssId, mtName, rowUpdates.slice(i, i + 100));
+          if (i + 100 < rowUpdates.length) await sleep(400);
+        }
+        console.log(`[ip-sweep] ${agent.agentCode}: wrote ${rowUpdates.length} row updates`);
+      }
+
+      // ── Step 7: Re-read MT and refresh Campaign_Tracker stats ────────────────
+      if (rowUpdates.length && ctH.length) {
+        try {
+          const { rows: freshMt } = await readSheet(ssId, mtName);
+          const ctUpdates = [];
+          const ctCompletedCol  = ctH.indexOf('Completed');
+          const ctConnectedCol  = ctH.indexOf('Connected');
+          const ctNcCol         = ctH.indexOf('Not Connected');
+          const ctFailedCol     = ctH.indexOf('Failed');
+          const ctQualCol       = ctH.indexOf('Qualified');
+          const ctMinutesCol    = ctH.indexOf('Actual Minutes');
+          const ctStatusCol2    = ctH.indexOf('Status');
+          const ctCountCol      = ctH.indexOf('Contacts Count');
+          const ctUpdCol        = ctH.indexOf('Last Updated');
+          const mhReq           = headers.indexOf('Request ID');
+          const mhSt            = headers.indexOf('Status');
+          const mhDur           = headers.indexOf('Duration (Minutes)');
+
+          // Build stats per reqId
+          const stats = {};
+          freshMt.forEach(row => {
+            const rId = mhReq >= 0 ? String(row[mhReq] || '').trim() : '';
+            if (!rId || !inProgressReqIds.has(rId)) return;
+            if (!stats[rId]) stats[rId] = { total:0, completed:0, nc:0, failed:0, minutes:0, qualified:0 };
+            stats[rId].total++;
+            const s = String(row[mhSt] || '').toUpperCase();
+            if (s === 'COMPLETED') {
+              stats[rId].completed++;
+              stats[rId].minutes += Number(row[mhDur] || 0);
+              const result2 = {};
+              resultFields.forEach(f => { const col = headers.indexOf('out.' + f); result2[f] = col >= 0 ? row[col] : ''; });
+              if (isQualified(agent, result2)) stats[rId].qualified++;
+            }
+            if (s === 'NOT_CONNECTED') stats[rId].nc++;
+            if (s === 'FAILED' || s === 'CANCELLED') stats[rId].failed++;
+          });
+
+          ctRows.forEach((row, i) => {
+            const rId = String(row[ctReqCol] || '').trim();
+            if (!rId || !stats[rId]) return;
+            const s = stats[rId];
+            const done = s.completed + s.nc + s.failed;
+            const status = done >= s.total && s.total > 0 ? 'COMPLETED' : 'IN_PROGRESS';
+            const newRow = [...row];
+            const setC = (col, val) => { if (col >= 0) newRow[col] = val; };
+            setC(ctCountCol,    s.total);
+            setC(ctCompletedCol,s.completed);
+            setC(ctConnectedCol,s.completed);
+            setC(ctNcCol,       s.nc);
+            setC(ctFailedCol,   s.failed);
+            setC(ctQualCol,     s.qualified);
+            setC(ctMinutesCol,  Math.round(s.minutes * 100) / 100);
+            setC(ctStatusCol2,  status);
+            setC(ctUpdCol,      new Date().toISOString());
+            ctUpdates.push({ rowIndex: i + 2, values: newRow });
+          });
+
+          if (ctUpdates.length) {
+            await batchWriteRows(ssId, ctName, ctUpdates);
+            console.log(`[ip-sweep] ${agent.agentCode}: CT refreshed (${ctUpdates.length} rows)`);
+          }
+        } catch (e) {
+          console.warn(`[ip-sweep] ${agent.agentCode}: CT refresh failed:`, e.message);
+        }
+      }
+
+      await sleep(1500);
     } catch (err) {
-      console.error(`[nc-sweep] Error on ${agent.agentCode}:`, err.message);
+      console.error(`[ip-sweep] Error on ${agent.agentCode}:`, err.message);
     }
   }
-  console.log('[nc-sweep] Done.');
+  console.log(`[ip-sweep] Done — agents=${totalAgents} fetched=${totalFetched} updated=${totalUpdated} staleClosed=${totalClosed}`);
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // JOB 1: POLL ACTIVE BATCHES

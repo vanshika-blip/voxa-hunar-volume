@@ -1235,9 +1235,25 @@ async function handleTestCall(actor, body) {
   const reqId  = `test_${dateTs}_${actor.email.split('@')[0].replace(/[^a-z0-9]/gi, '').slice(0, 8)}`;
   const cv     = agent.customVariables || [];
 
-  // Build custom_data from body.custom_data if provided
+  // Build custom_data from body.custom_data — validate all required custom vars are present
   const customData = {};
-  cv.forEach(k => { if (body.custom_data?.[k] !== undefined) customData[k] = String(body.custom_data[k] || ''); });
+  const missingVars = [];
+  cv.forEach(k => {
+    const v = body.custom_data?.[k];
+    if (v !== undefined && String(v).trim() !== '') {
+      customData[k] = String(v).trim();
+    } else {
+      missingVars.push(k);
+    }
+  });
+  if (missingVars.length > 0) {
+    return {
+      ok: false,
+      error: 'MISSING_CUSTOM_DATA',
+      message: `This agent requires the following fields: ${missingVars.join(', ')}. Please fill them in before triggering the test call.`,
+      missingFields: missingVars,
+    };
+  }
 
   const payload = {
     agent_id: agent.agentId, request_id: reqId,
@@ -1928,14 +1944,16 @@ const mr = [...activeMr, ...archMr];
 async function handleForceRebuildDashboard(actor) {
   if (actor.role !== 'super_admin') return { ok: false, error: 'FORBIDDEN' };
 
-  console.log('[forceRebuild] Starting full dashboard cache rebuild…');
+  console.log('[forceRebuild] Starting full dashboard cache rebuild (all history)…');
   const t0 = Date.now();
 
   const agents = (await getAllAgents()).filter(a => a.active && a.spreadsheetId);
   const users  = await getAllUsers();
-  users.forEach(u => { umap2[u.email.toLowerCase()] = u; }); // populate module-level map
+  const umap   = {};
+  users.forEach(u => { umap[u.email.toLowerCase()] = u; });
+  users.forEach(u => { umap2[u.email.toLowerCase()] = u; }); // also populate module-level map
 
-  // Build trigger maps from Trigger Log
+  // Build trigger maps from Trigger Log (full history — no cutoff)
   const trigMap  = {}; // agentCode|reqId → email
   const trigTeam = {}; // agentCode|reqId → team
   try {
@@ -1951,20 +1969,27 @@ async function handleForceRebuildDashboard(actor) {
     }
   } catch (e) { console.warn('[forceRebuild] Trigger Log read failed:', e.message); }
 
-  const CUTOFF_DAYS = 32;
-  const cutoffStr   = new Date(Date.now() - CUTOFF_DAYS * 86400_000).toLocaleDateString('en-CA', { timeZone: IST_TZ });
+  // No cutoff — scan all historical data
   const agg = {}; // key → { date, team, agent, email, reqId, calls, minutes, qualified, lineup, connected }
 
   const deduped = dedupeAgentsBySsId(agents);
-  console.log(`[forceRebuild] Scanning ${deduped.length} agent spreadsheets…`);
+  console.log(`[forceRebuild] Scanning ${deduped.length} agent spreadsheets (full history)…`);
 
   for (const agent of deduped) {
     try {
-      // ── Master Tracker ──────────────────────────────────────────────────
-      const { headers: mh, rows: mr } = await readSheet(agent.spreadsheetId, AGT.MT);
+      // ── Master Tracker (active + archive) ───────────────────────────────────
+      const { headers: mh, rows: activeMr } = await readSheet(agent.spreadsheetId, AGT.MT);
       if (!mh.length) continue;
+
+      // Also pull archive rows so historical campaigns aren't missing
+      let archMr = [];
+      try {
+        const { rows: ar } = await readSheet(agent.spreadsheetId, 'Master_Tracker_Archive');
+        archMr = ar;
+      } catch (_) {}
+      const mr = [...activeMr, ...archMr];
+
       const si   = mh.indexOf('Status');
-      const cidi = mh.indexOf('Call ID');
       const ri   = mh.indexOf('Request ID');
       const di   = mh.indexOf('Duration (Minutes)');
       const sai  = mh.indexOf('Started At');
@@ -1974,16 +1999,15 @@ async function handleForceRebuildDashboard(actor) {
 
       mr.forEach(row => {
         const status = String(row[si] || '').toUpperCase();
-        if (status !== 'COMPLETED') return; // only completed calls have duration data
+        if (status !== 'COMPLETED') return; // only completed calls contribute to dashboard
         const reqId = ri >= 0 ? String(row[ri] || '').trim() : '';
         const email = trigMap[agent.agentCode + '|' + reqId] || '';
-        const team  = trigTeam[agent.agentCode + '|' + reqId] || umap2[email]?.team || '';
+        const team  = trigTeam[agent.agentCode + '|' + reqId] || umap[email]?.team || '';
 
         const dv = (sai >= 0 ? row[sai] : null) || (cai >= 0 ? row[cai] : null);
         if (!dv) return;
         let d; try { d = new Date(dv); if (isNaN(d.getTime())) return; } catch (_) { return; }
         const dateStr = d.toLocaleDateString('en-CA', { timeZone: IST_TZ });
-        if (dateStr < cutoffStr) return; // skip data older than 32 days
 
         const key = `${dateStr}|${team}|${agent.agentCode}|${email}|${reqId}`;
         if (!agg[key]) agg[key] = { date: dateStr, team, agent: agent.agentCode, email, reqId, calls: 0, minutes: 0, qualified: 0, lineup: 0, connected: 0 };
@@ -1999,9 +2023,11 @@ async function handleForceRebuildDashboard(actor) {
         if (isQualified(agent, result)) agg[key].qualified++;
       });
 
-      // ── Qualified Leads (for lineup count) ─────────────────────────────
+      await sleep(300);
+
+      // ── Qualified Leads (for lineup count) ───────────────────────────────────
       const { headers: qh, rows: qr } = await readSheet(agent.spreadsheetId, AGT.QL);
-      if (!qh.length) continue;
+      if (!qh.length) { console.log(`[forceRebuild] Done: ${agent.agentCode} (no QL)`); continue; }
       const fbi = qh.indexOf('Feedback');
       const qri = qh.indexOf('Request ID');
       const qai = qh.indexOf('Assigned To Email');
@@ -2012,7 +2038,7 @@ async function handleForceRebuildDashboard(actor) {
         if (!_isInterviewLinedUp(fb)) return;
         const reqId   = qri >= 0 ? String(row[qri] || '').trim() : '';
         const email   = qai >= 0 ? String(row[qai] || '').toLowerCase() : (trigMap[agent.agentCode + '|' + reqId] || '');
-        const team    = trigTeam[agent.agentCode + '|' + reqId] || umap2[email]?.team || '';
+        const team    = trigTeam[agent.agentCode + '|' + reqId] || umap[email]?.team || '';
         let dateStr   = '';
         if (qda >= 0 && row[qda]) {
           try { dateStr = new Date(row[qda]).toLocaleDateString('en-CA', { timeZone: IST_TZ }); } catch (_) {}
@@ -2022,31 +2048,32 @@ async function handleForceRebuildDashboard(actor) {
         else          { agg[key] = { date: dateStr, team, agent: agent.agentCode, email, reqId, calls: 0, minutes: 0, qualified: 0, lineup: 1, connected: 0 }; }
       });
 
-      console.log(`[forceRebuild] Done: ${agent.agentCode}`);
+      await sleep(300);
+      console.log(`[forceRebuild] Done: ${agent.agentCode} (mt=${mr.length} ql=${qr.length})`);
     } catch (e) {
       console.warn(`[forceRebuild] Error on ${agent.agentCode}:`, e.message);
     }
   }
 
-  // ── Write to _Dashboard_Cache ──────────────────────────────────────────────
+  // ── Write to _Dashboard_Cache (full replace) ───────────────────────────────
   await ensureSheet(MAIN_SS_ID, DASH_CACHE_SHEET, DASH_CACHE_H, '#1a6fdc');
   await clearRange(MAIN_SS_ID, `'${DASH_CACHE_SHEET}'!A2:Z`);
-  const now = new Date().toISOString();
+  const nowIso = new Date().toISOString();
   const cacheRows = Object.values(agg).map(r => [
     r.date, r.team, r.agent, r.email, r.reqId,
     r.calls, Math.round(r.minutes * 100) / 100,
-    r.qualified, r.lineup, now, r.connected,
+    r.qualified, r.lineup, nowIso, r.connected,
   ]);
   if (cacheRows.length) await appendRows(MAIN_SS_ID, DASH_CACHE_SHEET, cacheRows);
 
   const elapsed = Math.round((Date.now() - t0) / 1000);
-  console.log(`[forceRebuild] Done in ${elapsed}s — ${cacheRows.length} rows written`);
+  console.log(`[forceRebuild] Done in ${elapsed}s — ${cacheRows.length} rows written from ${deduped.length} agents`);
   return {
     ok: true,
     rowsWritten: cacheRows.length,
     agentsScanned: deduped.length,
     elapsed: elapsed + 's',
-    message: `Dashboard cache rebuilt with ${cacheRows.length} rows from ${deduped.length} agents.`,
+    message: `Dashboard cache rebuilt from scratch: ${cacheRows.length} rows from ${deduped.length} agents (full history, no date cutoff).`,
   };
 }
 
