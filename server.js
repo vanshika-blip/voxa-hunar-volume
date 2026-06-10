@@ -38,6 +38,10 @@ const {
   getStatus,
   scheduleAgentPoll,
   registerFreshCampaign,
+  archiveCompletedCampaignCT,
+  forceCampaignComplete,
+  checkAndForceComplete27h,
+  processWebhookCallSummary,
 } = require('./poller');
 
 const app  = express();
@@ -1140,6 +1144,13 @@ async function handleUploadContacts(actor, body) {
       return { callee_name: String(r.callee_name || '').trim(), mobile_number: String(r.mobile_number || '').trim(), custom_data: cd };
     }),
     remove_invalid_rows: true, remove_duplicate_phone_numbers: true, timezone: IST_TZ,
+    // Webhook: Hunar fires call_summary once when lifecycle completes (all retries done).
+    // This is the fast path — poller remains the safety net for any missed events.
+    ...(process.env.WEBHOOK_BASE_URL ? {
+      callback_config: {
+        call_summary_callback_url: `${process.env.WEBHOOK_BASE_URL}/webhook/hunar/call-summary`,
+      },
+    } : {}),
   };
 
   const apiRes = await hunarPost('/external/v1/calls/bulk/', payload);
@@ -1180,7 +1191,9 @@ async function handleUploadContacts(actor, body) {
       const set = (n, v) => { const k = mtH.indexOf(n); if (k >= 0) row[k] = v; };
       set('Call ID', cid); set('Request ID', c.request_id || reqId);
       set('Callee Name', c.callee_name || ''); set('Mobile Number', c.mobile_number || '');
-      set('Status', c.status || 'INITIATED'); set('Triggered By', actor.email);
+      set('Status', c.status || 'INITIATED');
+      set('Lifecycle Status', 'IN_PROGRESS'); // all calls start with lifecycle IN_PROGRESS
+      set('Triggered By', actor.email);
       set('Created At', now.toISOString());
       mtRows.push(row);
     });
@@ -1305,6 +1318,27 @@ async function handleTestCall(actor, body) {
 }
 
 // ─── Leads ─────────────────────────────────────────────────────────────────────
+
+// ── Lead tab constants ────────────────────────────────────────────────────────
+// Priority order: DNP > Callback > Completed > Active
+// DNP-3/4/5 used to fall into "completed" — they now land in "dnp" only.
+const _LEAD_DNP_STATUSES = new Set(['DNP-1','DNP-2','DNP-3','DNP-4','DNP-5']);
+const _LEAD_CB_KEYWORDS  = ['call back','callback','call-back','ring back','follow up','followup','follow-up','reschedule'];
+const _LEAD_COMPLETED_CS = new Set(['Connected','Irrelevant','Hiring On Hold','Hiring On hold']);
+
+function _classifyLeadTab(lead) {
+  const cs = String(lead['Call Status'] || '').trim();
+  const fb = String(lead['Feedback']    || '').trim().toLowerCase();
+  // 1. DNP always wins — never shows in Completed
+  if (_LEAD_DNP_STATUSES.has(cs)) return 'dnp';
+  // 2. Callback Requested or feedback contains callback keywords
+  if (cs === 'Callback Requested' || _LEAD_CB_KEYWORDS.some(kw => fb.includes(kw))) return 'callback';
+  // 3. Explicitly completed statuses
+  if (_LEAD_COMPLETED_CS.has(cs)) return 'completed';
+  // 4. Everything else (blank, in-progress, new) → active
+  return 'active';
+}
+
 async function handleGetLeads(actor, body) {
   const agents = await getAllAgents();
   const users2 = await getAllUsers();
@@ -1353,6 +1387,8 @@ async function handleGetLeads(actor, body) {
     seenIds.add(id);
     return true;
   });
+  // Stamp every lead with its tab classification
+  allLeads.forEach(l => { l._tab = _classifyLeadTab(l); });
   return { ok: true, leads: allLeads, headers, agentCode };
 }
 
@@ -1570,6 +1606,43 @@ function _isNcRetryReqId(reqId) {
   return String(reqId || '').startsWith('NOTCONNECTED_');
 }
 
+/**
+ * Parse one Campaign_Tracker / Campaign_Tracker_Archive row and push it into
+ * the campaigns array if the actor is allowed to see it.
+ * isArchived=true means the row came from Campaign_Tracker_Archive.
+ */
+function _pushCampaignRow(r, a, campaigns, seenReqIds, actor, visEmails, emailToTeam, isArchived) {
+  if (!r[0]) return;
+  const reqId = String(r[0]).trim();
+  if (_isNcRetryReqId(reqId)) return;    // never show NC auto-retry rows in the UI
+  if (seenReqIds.has(reqId)) return;     // dedupe across live + archive
+  seenReqIds.add(reqId);
+  const by = String(r[2] || '').toLowerCase().trim();
+  if (actor.role === 'recruiter' && by !== actor.email) return;
+  if (actor.role === 'individual_contributor' && by !== actor.email) return;
+  if (actor.role === 'team_lead' && !visEmails.has(by)) return;
+  campaigns.push({
+    agentCode:        a.agentCode,
+    agentName:        a.displayName,
+    requestId:        reqId,
+    campaignName:     String(r[1] || ''),
+    triggeredBy:      by,
+    triggeredByTeam:  emailToTeam[by] || '',
+    triggeredAt:      r[3],
+    contactsCount:    r[4],
+    status:           r[5],
+    completed:        r[6],
+    connected:        r[7],
+    notConnected:     r[8],
+    failed:           r[9],
+    qualified:        r[10],
+    actualMinutes:    Math.round(Number(r[11] || 0) * 100) / 100,
+    estimatedMinutes: r[12],
+    lastUpdated:      r[13],
+    _archived:        isArchived,   // frontend uses this for ACTIVE / ARCHIVED tab
+  });
+}
+
 async function handleGetCampaigns(actor, body) {
   const agents = await getAllAgents();
   const users  = await getAllUsers();
@@ -1577,42 +1650,52 @@ async function handleGetCampaigns(actor, body) {
   const visEmails = new Set(visibleUserEmails(actor, users).map(e => e.toLowerCase()));
   const emailToTeam = {};
   users.forEach(u => { if (u.team) emailToTeam[u.email] = u.team; });
-  const agentCode = String(body.agentCode || '').trim();
-  // Dedupe by ssId — same sheet must not be read twice
-  const rawTargets2 = agentCode ? vis.filter(a => a.agentCode === agentCode) : vis;
-  const targets2    = dedupeAgentsBySsId(rawTargets2);
-  let campaigns = [];
+  const agentCode   = String(body.agentCode || '').trim();
+  // includeArchived: true → also read Campaign_Tracker_Archive (frontend passes this
+  // when the user clicks the "Archived" tab so we don't load archive on every call)
+  const includeArch = body.includeArchived === true;
+
+  const rawTargets = agentCode ? vis.filter(a => a.agentCode === agentCode) : vis;
+  const targets    = dedupeAgentsBySsId(rawTargets);
+  const campaigns  = [];
   const seenReqIds = new Set();
-  for (const a of targets2) {
+
+  for (const a of targets) {
     if (!a.spreadsheetId) continue;
     try {
+      // Live campaigns (always loaded)
       const { rows } = await readSheet(a.spreadsheetId, AGT.CT);
-      rows.forEach(r => {
-        if (!r[0]) return;
-        const reqId = String(r[0]).trim();
-        // Hide NC auto-retry campaigns from the UI
-        if (_isNcRetryReqId(reqId)) return;
-        // Dedupe by requestId — same campaign must not appear twice
-        if (seenReqIds.has(reqId)) return;
-        seenReqIds.add(reqId);
-        const by = String(r[2] || '').toLowerCase().trim();
-        if (actor.role === 'recruiter' && by !== actor.email) return;
-        if (actor.role === 'individual_contributor' && by !== actor.email) return;
-        if (actor.role === 'team_lead' && !visEmails.has(by)) return;
-        campaigns.push({
-          agentCode: a.agentCode, agentName: a.displayName,
-          requestId: reqId, campaignName: String(r[1] || ''),
-          triggeredBy: by, triggeredByTeam: emailToTeam[by] || '',
-          triggeredAt: r[3], contactsCount: r[4], status: r[5],
-          completed: r[6], connected: r[7], notConnected: r[8], failed: r[9],
-          qualified: r[10], actualMinutes: Math.round(Number(r[11] || 0) * 100) / 100,
-          estimatedMinutes: r[12], lastUpdated: r[13],
-        });
-      });
+      rows.forEach(r => _pushCampaignRow(r, a, campaigns, seenReqIds, actor, visEmails, emailToTeam, false));
+
+      // Archived campaigns (only when the frontend explicitly requests them)
+      if (includeArch) {
+        try {
+          const { rows: ar } = await readSheet(a.spreadsheetId, 'Campaign_Tracker_Archive');
+          ar.forEach(r => _pushCampaignRow(r, a, campaigns, seenReqIds, actor, visEmails, emailToTeam, true));
+        } catch (_) {} // archive sheet may not exist yet — skip silently
+      }
     } catch (_) {}
   }
+
   campaigns.sort((a, b) => (a.triggeredAt < b.triggeredAt ? 1 : -1));
   return { ok: true, campaigns };
+}
+
+// ─── Force-complete a campaign (session-authenticated, from frontend) ─────────
+// Only super_admin can call this. Delegates all the real work to the
+// forceCampaignComplete() function in poller.js which fetches every call from
+// Hunar and writes results directly to the agent spreadsheet.
+async function handleForceCampaignComplete(actor, body) {
+  if (actor.role !== 'super_admin') return { ok: false, error: 'FORBIDDEN' };
+  const agentCode = String(body.agentCode || '').trim();
+  const requestId = String(body.requestId || '').trim();
+  if (!agentCode || !requestId) return { ok: false, error: 'agentCode and requestId are required' };
+  try {
+    const result = await forceCampaignComplete(agentCode, requestId);
+    return { ok: true, ...result };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
 }
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
@@ -2691,6 +2774,7 @@ async function handleAction(body) {
     case 'repairagentsheets':    return handleRepairAgentSheets(actor);
     case 'uploadcontacts':
     case 'triggercampaign':      return handleUploadContacts(actor, body);
+    case 'forcecompletecampaign': return handleForceCampaignComplete(actor, body);
     case 'getleads':             return handleGetLeads(actor, body);
     case 'updatelead':           return handleUpdateLead(actor, body);
     case 'assignlead':           return handleAssignLead(actor, body);
@@ -2773,22 +2857,75 @@ app.post('/poller/force-refresh', requirePollerToken, async (req, res) => {
 });
 
 const JOB_MAP = {
-  poll:      () => pollActiveBatches(),
-  backfill:  () => backfillMissingOutputs(),
-  repair:    () => repairUnassignedLeads(),
-  sessions:  () => cleanupExpiredSessions(),
-  dedupe:    () => dedupeAllSheets(),
-  archLeads: () => archiveCompletedLeads(),
-  archMT:    () => archiveCompletedMT(),
-  archManual:() => archiveManualTracker(),
-  callbacks: () => processCallbackQueue(),
-  retries:   () => processRetryQueue(),
+  poll:         () => pollActiveBatches(),
+  backfill:     () => backfillMissingOutputs(),
+  repair:       () => repairUnassignedLeads(),
+  sessions:     () => cleanupExpiredSessions(),
+  dedupe:       () => dedupeAllSheets(),
+  archLeads:    () => archiveCompletedLeads(),
+  archMT:       () => archiveCompletedMT(),
+  archManual:   () => archiveManualTracker(),
+  archCT:       () => archiveCompletedCampaignCT(),
+  callbacks:    () => processCallbackQueue(),
+  retries:      () => processRetryQueue(),
+  sweep27h:     () => checkAndForceComplete27h(),
 };
 app.post('/poller/run/:job', requirePollerToken, async (req, res) => {
   const fn = JOB_MAP[req.params.job];
   if (!fn) return res.status(400).json({ ok: false, error: `Unknown job: ${req.params.job}`, available: Object.keys(JOB_MAP) });
   try { const result = await fn(); res.json({ ok: true, job: req.params.job, result: result || 'done' }); }
   catch (err) { res.status(500).json({ ok: false, error: err.message }); }
+});
+
+// ─── Force-complete a specific campaign ──────────────────────────────────────
+// POST /poller/force-complete
+// Body: { agentCode: string, requestId: string }
+// Auth: requires POLLER_TOKEN in Authorization header
+//
+// Called from the admin Campaign card "Force Complete" button.
+// Fetches every call for the campaign from Hunar, writes results to
+// Master_Tracker, pushes qualified leads, and marks the campaign COMPLETED.
+app.post('/poller/force-complete', requirePollerToken, async (req, res) => {
+  const agentCode = String(req.body?.agentCode || '').trim();
+  const requestId = String(req.body?.requestId || '').trim();
+  if (!agentCode || !requestId) {
+    return res.status(400).json({ ok: false, error: 'agentCode and requestId are required' });
+  }
+  try {
+    const result = await forceCampaignComplete(agentCode, requestId);
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ─── Hunar Webhook — call_summary ─────────────────────────────────────────────
+// POST /webhook/hunar/call-summary
+//
+// Hunar fires this once when a call's lifecycle_status reaches a terminal state
+// (COMPLETED / NOT_CONNECTED / FAILED / CANCELLED) — after all retries are done.
+//
+// Why this is better than polling for retried calls:
+//   During retries, per-attempt status=NOT_CONNECTED but lifecycle=IN_PROGRESS.
+//   Polling used to skip NOT_CONNECTED rows as "terminal" — silently missing retry
+//   completions. This webhook fires exactly once at lifecycle end, guaranteed.
+//
+// Security: no signature verification yet (Hunar roadmap) — relies on the
+//   obscurity of the URL. Add WEBHOOK_SECRET check here when Hunar ships it.
+//
+// IMPORTANT: respond 200 immediately, process async.
+// Hunar times out after 30s and retries with exponential backoff (1m→2m→4m→8m).
+app.post('/webhook/hunar/call-summary', async (req, res) => {
+  res.status(200).json({ ok: true }); // respond before any async work
+  const event = req.body;
+  if (!event || event.event_type !== 'call_summary') return;
+  setImmediate(async () => {
+    try {
+      await processWebhookCallSummary(event);
+    } catch (e) {
+      console.error('[webhook] call_summary processing error:', e.message);
+    }
+  });
 });
 
 // ─── Archive endpoints ────────────────────────────────────────────────────────

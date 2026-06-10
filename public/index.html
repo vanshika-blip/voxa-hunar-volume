@@ -412,9 +412,14 @@ function RoleTag({ role }) {
   const labels = { super_admin:"Super Admin", admin:"Admin", team_lead:"Team Lead", recruiter:"Recruiter", individual_contributor:"IC" };
   return <span className={"t-tag "+(map[role]||"t-tag-gray")}>{labels[role]||role}</span>;
 }
-function StatusPill({ status }) {
-  const s = String(status||"").toUpperCase();
-  const map = { COMPLETED:"done", IN_PROGRESS:"live", NOT_STARTED:"gray", FAILED:"live", CANCELLED:"arch", NOT_CONNECTED:"hold", SCHEDULED:"gray", INITIATED:"blue", RINGING:"blue", ACTIVE:"live" };
+function StatusPill({ status, lifecycleStatus }) {
+  const s  = String(status||"").toUpperCase();
+  const ls = String(lifecycleStatus||"").toUpperCase();
+  // If per-attempt status is NOT_CONNECTED but lifecycle is still IN_PROGRESS,
+  // show "Retrying" — Hunar will attempt the call again.
+  const isRetrying = s === 'NOT_CONNECTED' && ls === 'IN_PROGRESS';
+  if (isRetrying) return <span className="t-pill t-pill-blue" title="Call not connected — retry pending">Retrying…</span>;
+  const map = { COMPLETED:"done", IN_PROGRESS:"live", NOT_STARTED:"gray", FAILED:"arch", CANCELLED:"arch", NOT_CONNECTED:"hold", SCHEDULED:"gray", INITIATED:"blue", RINGING:"blue", ACTIVE:"live" };
   return <span className={"t-pill t-pill-"+(map[s]||"gray")}>{s||"—"}</span>;
 }
 const DISC_COLORS = ["#e2001a","#009149","#0066b3","#663399","#ff7a00","#555"];
@@ -1548,42 +1553,40 @@ function LeadsView({ user, users, agents, teams, initialFilter, onClearFilter })
   const inCols = headers.filter(h=>h.startsWith("in."));
   const shownHeaders = [...fixedCols.filter(h=>headers.includes(h)), ...dateCols, ...outCols, ...inCols];
 
-  // ── Tab filter: Active vs Completed
-  // Active: empty Call Status, OR DNP-1/DNP-2, OR Connected+callback feedback
-  // Completed: Connected/Irrelevant + filled Feedback, OR Hiring On hold, OR DNP-3/4/5
+  // ── Tab filter: Active | Completed | DNP | Callback
+  // Uses _tab field stamped by server (priority: dnp > callback > completed > active).
+  // Falls back to client-side logic for leads loaded before the server patch.
+  const _DNP_SET = new Set(["DNP-1","DNP-2","DNP-3","DNP-4","DNP-5"]);
+  const _CB_KWS  = ["call back","callback","call-back","ring back","follow up","followup","follow-up","reschedule"];
+  const _COMP_CS = new Set(["Connected","Irrelevant","Hiring On Hold","Hiring On hold"]);
+  function _getLeadTab(l) {
+    if (l._tab) return l._tab;
+    const cs = String(l["Call Status"]||"").trim();
+    const fb = String(l["Feedback"]||"").toLowerCase().trim();
+    if (_DNP_SET.has(cs)) return "dnp";
+    if (cs === "Callback Requested" || _CB_KWS.some(k => fb.includes(k))) return "callback";
+    if (_COMP_CS.has(cs)) return "completed";
+    return "active";
+  }
+
   const tabFilteredLeads = useMemo(() => {
-    const CALLBACK_HINTS = ["call back","callback","call back scheduled"];
-    function isCompleted(l) {
-      const cs = String(l["Call Status"]||"").trim();
-      const fb = String(l["Feedback"]||"").trim();
-      if (cs === "Hiring On hold") return true;
-      if (cs === "DNP-3" || cs === "DNP-4" || cs === "DNP-5") return true;
-      if ((cs === "Connected" || cs === "Irrelevant") && fb !== "") return true;
-      return false;
-    }
-    function isActive(l) {
-      const cs = String(l["Call Status"]||"").trim();
-      const fb = String(l["Feedback"]||"").toLowerCase().trim();
-      if (!cs) return true;
-      if (cs === "DNP-1" || cs === "DNP-2") return true;
-      if (cs === "Connected" && (!fb || CALLBACK_HINTS.some(k => fb.includes(k)))) return true;
-      return false;
-    }
     function parseLeadDate(l) {
       const v = l["Started At"] || l["Date Added"] || l["Created At"] || "";
       if (!v) return 0;
       try { const d = new Date(v); return isNaN(d.getTime()) ? 0 : d.getTime(); } catch { return 0; }
     }
-    let result = leads.filter(l => tab === "completed" ? isCompleted(l) : isActive(l));
-    // Date-range filter for completed tab
+    let result = leads.filter(l => _getLeadTab(l) === tab);
+    // Date-range sub-filter for completed tab
     if (tab === "completed" && completedRange !== "all") {
       const days = completedRange === "7d" ? 7 : 30;
       const cutoff = Date.now() - days * 86400000;
       result = result.filter(l => parseLeadDate(l) >= cutoff);
     }
-    // Sort newest first
-    result = [...result].sort((a, b) => parseLeadDate(b) - parseLeadDate(a));
-    return result;
+    return [...result].sort((a, b) => {
+      const av = a["Started At"]||a["Date Added"]||a["Created At"]||"";
+      const bv = b["Started At"]||b["Date Added"]||b["Created At"]||"";
+      return new Date(bv).getTime() - new Date(av).getTime();
+    });
   }, [leads, tab, completedRange]);
 
   const { filters, filtered: rawFiltered, colValues, setColFilter, clearFilters } = useTableFilters(tabFilteredLeads, shownHeaders);
@@ -1600,28 +1603,18 @@ function LeadsView({ user, users, agents, teams, initialFilter, onClearFilter })
     return result;
   }, [rawFiltered, teamFilterEmails]);
 
-  // Counts shown in the tab strip — independent of column filters
-  // so users always know how many leads exist in each tab.
- const tabCounts = useMemo(() => {
-    const CALLBACK_HINTS = ["call back","callback","call back scheduled"];
-    let baseLeads = leads;
+  // Tab counts — always computed from the full leads list, ignoring column filters
+  const tabCounts = useMemo(() => {
+    let base = leads;
     if (teamFilterEmails) {
-      baseLeads = baseLeads.filter(l => {
+      base = base.filter(l => {
         const ae = String(l["Assigned To Email"]||"").toLowerCase();
         return !ae || teamFilterEmails.has(ae);
       });
     }
-    let active = 0, completed = 0;
-    baseLeads.forEach(l => {
-      const cs = String(l["Call Status"]||"").trim();
-      const fb = String(l["Feedback"]||"").trim();
-      const fbLower = fb.toLowerCase();
-      if (cs === "Hiring On hold" || cs === "DNP-3" || cs === "DNP-4" || cs === "DNP-5") { completed++; return; }
-      if ((cs === "Connected" || cs === "Irrelevant") && fb !== "") { completed++; return; }
-      if (!cs || cs === "DNP-1" || cs === "DNP-2") { active++; return; }
-      if (cs === "Connected" && CALLBACK_HINTS.some(k => fbLower.includes(k))) { active++; return; }
-    });
-    return { active, completed };
+    const counts = { active: 0, completed: 0, dnp: 0, callback: 0 };
+    base.forEach(l => { counts[_getLeadTab(l)] = (counts[_getLeadTab(l)] || 0) + 1; });
+    return counts;
   }, [leads, teamFilterEmails]);
 
   const canBulkAssign = user.role!=="recruiter";
@@ -1700,11 +1693,19 @@ function LeadsView({ user, users, agents, teams, initialFilter, onClearFilter })
             <button
               onClick={()=>{setTab("active");setSelected(new Set());}}
               style={{padding:"6px 16px",fontSize:11,fontFamily:"var(--fd)",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase",cursor:"pointer",border:"1px solid rgba(255,255,255,.25)",borderRight:"none",background:tab==="active"?"#ffffff":"transparent",color:tab==="active"?"var(--black)":"rgba(255,255,255,.7)"}}
-            >Active <span style={{opacity:.6,marginLeft:4}}>{tabCounts.active}</span></button>
+            >Active <span style={{opacity:.6,marginLeft:4}}>{tabCounts.active||0}</span></button>
             <button
               onClick={()=>{setTab("completed");setSelected(new Set());}}
-              style={{padding:"6px 16px",fontSize:11,fontFamily:"var(--fd)",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase",cursor:"pointer",border:"1px solid rgba(255,255,255,.25)",background:tab==="completed"?"#ffffff":"transparent",color:tab==="completed"?"var(--black)":"rgba(255,255,255,.7)"}}
-            >Completed <span style={{opacity:.6,marginLeft:4}}>{tabCounts.completed}</span></button>
+              style={{padding:"6px 16px",fontSize:11,fontFamily:"var(--fd)",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase",cursor:"pointer",border:"1px solid rgba(255,255,255,.25)",borderRight:"none",background:tab==="completed"?"#ffffff":"transparent",color:tab==="completed"?"var(--black)":"rgba(255,255,255,.7)"}}
+            >Completed <span style={{opacity:.6,marginLeft:4}}>{tabCounts.completed||0}</span></button>
+            <button
+              onClick={()=>{setTab("dnp");setSelected(new Set());}}
+              style={{padding:"6px 16px",fontSize:11,fontFamily:"var(--fd)",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase",cursor:"pointer",border:"1px solid rgba(255,255,255,.25)",borderRight:"none",background:tab==="dnp"?"#fee2e2":"transparent",color:tab==="dnp"?"#991b1b":"rgba(255,255,255,.7)"}}
+            >DNP <span style={{opacity:.6,marginLeft:4}}>{tabCounts.dnp||0}</span></button>
+            <button
+              onClick={()=>{setTab("callback");setSelected(new Set());}}
+              style={{padding:"6px 16px",fontSize:11,fontFamily:"var(--fd)",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase",cursor:"pointer",border:"1px solid rgba(255,255,255,.25)",background:tab==="callback"?"#fef9c3":"transparent",color:tab==="callback"?"#854d0e":"rgba(255,255,255,.7)"}}
+            >Callback <span style={{opacity:.6,marginLeft:4}}>{tabCounts.callback||0}</span></button>
           </div>
           {tab==="completed" && (
             <div style={{display:"flex",gap:0,marginTop:6}}>
@@ -1955,30 +1956,82 @@ function UploadView({ user, agents, refreshMe }) {
 // ─────────────────────────────────────────────────────────────
 // CAMPAIGNS VIEW
 // ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// FORCE COMPLETE BUTTON — super_admin only
+// Calls /forcecompletecampaign on the server, which delegates to
+// poller.js forceCampaignComplete(). Fetches all Hunar call data
+// for the campaign and marks it COMPLETED.
+// ─────────────────────────────────────────────────────────────
+function ForceCompleteBtn({ agentCode, requestId, onDone }) {
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(false);
+  const [err,  setErr]  = useState("");
+
+  async function run(e) {
+    e.stopPropagation();
+    if (!window.confirm(`Force-complete campaign ${requestId}?\n\nThis will fetch all call results from Hunar and mark the campaign COMPLETED.\nAny still-live calls will be set to NOT_CONNECTED.\n\nContinue?`)) return;
+    setBusy(true); setErr("");
+    const r = await api("forceCompleteCampaign", { agentCode, requestId });
+    setBusy(false);
+    if (!r.ok) { setErr(r.error || r.message || "Failed"); return; }
+    setDone(true);
+    setTimeout(() => { setDone(false); onDone && onDone(); }, 2000);
+  }
+
+  if (done) return <span style={{fontSize:10,fontFamily:"var(--fd)",fontWeight:700,color:"var(--green)",padding:"4px 10px",border:"1.5px solid var(--green)"}}>✓ Done</span>;
+
+  return (
+    <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:3}}>
+      <button
+        className="t-btn t-btn-sm"
+        style={{background:"#fff3cd",color:"#856404",border:"1.5px solid #ffc107",fontSize:9}}
+        onClick={run}
+        disabled={busy}
+      >
+        {busy ? <Spin/> : "⚡ Force Complete"}
+      </button>
+      {err && <span style={{fontSize:9,color:"var(--red)",fontFamily:"var(--fm)",maxWidth:120,textAlign:"right"}}>{err}</span>}
+    </div>
+  );
+}
+
 function CampaignsView({ agents, user, teams, onViewLeads }) {
   const [selAgent,setSelAgent]=useState("");
   const [selTeam,setSelTeam]=useState("");
   const [rows,setRows]=useState([]); const [loading,setLoading]=useState(true);
   const [openCampaign,setOpenCampaign]=useState(null);
   const [campaignTab,setCampaignTab]=useState("qualified");
-  const [listTab, setListTab] = useState("active");   // "active" | "completed"
+  const [listTab, setListTab] = useState("active");   // "active" | "completed" | "archived"
   const [doneRange, setDoneRange] = useState("all"); // "7d"|"30d"|"all"
+  const [archLoaded, setArchLoaded] = useState(false); // lazy-load archive on first click
 
-  useEffect(()=>{
-    (async()=>{ setLoading(true); const r=await api("getCampaigns",{agentCode:selAgent}); setLoading(false);if(r.ok) {
-  const seen = new Set();
-  const unique = (r.campaigns||[]).filter(c => {
-    // Deduplicate by both requestId AND campaignName+triggeredAt to catch backend duplicates
-    const byId = c.requestId;
-    const byName = (c.campaignName||"") + "|" + (c.triggeredAt||"");
-    if (seen.has(byId) || seen.has(byName)) return false;
-    seen.add(byId);
-    if (byName !== "|") seen.add(byName);
-    return true;
-  });
-  setRows(unique);
-} })();
-  },[selAgent]);
+  async function loadCampaigns(includeArch) {
+    setLoading(true);
+    const r = await api("getCampaigns", { agentCode: selAgent, includeArchived: !!includeArch });
+    setLoading(false);
+    if (r.ok) {
+      const seen = new Set();
+      const unique = (r.campaigns||[]).filter(c => {
+        const byId = c.requestId;
+        const byName = (c.campaignName||"") + "|" + (c.triggeredAt||"");
+        if (seen.has(byId) || seen.has(byName)) return false;
+        seen.add(byId);
+        if (byName !== "|") seen.add(byName);
+        return true;
+      });
+      setRows(unique);
+      if (includeArch) setArchLoaded(true);
+    }
+  }
+
+  useEffect(()=>{ setArchLoaded(false); loadCampaigns(false); },[selAgent]);
+
+  async function handleTabChange(t) {
+    setListTab(t);
+    if (t === "archived" && !archLoaded) {
+      await loadCampaigns(true);
+    }
+  }
 
   if(openCampaign) {
     return <CampaignDetail campaign={openCampaign} agents={agents} tab={campaignTab} setTab={setCampaignTab} onBack={()=>setOpenCampaign(null)} onViewLeads={onViewLeads}/>;
@@ -1993,11 +2046,15 @@ function CampaignsView({ agents, user, teams, onViewLeads }) {
   const teamFiltered = selTeam ? rows.filter(r => r.triggeredByTeam === selTeam) : rows;
 
   const activeCamps = teamFiltered
-    .filter(c => c.status === "IN_PROGRESS")
+    .filter(c => !c._archived && c.status === "IN_PROGRESS")
     .sort((a,b) => campDate(b) - campDate(a));
 
   const completedAll = teamFiltered
-    .filter(c => c.status !== "IN_PROGRESS")
+    .filter(c => !c._archived && c.status !== "IN_PROGRESS")
+    .sort((a,b) => campDate(b) - campDate(a));
+
+  const archivedAll = teamFiltered
+    .filter(c => c._archived)
     .sort((a,b) => campDate(b) - campDate(a));
 
   const completedCamps = doneRange === "all" ? completedAll : (() => {
@@ -2006,9 +2063,16 @@ function CampaignsView({ agents, user, teams, onViewLeads }) {
     return completedAll.filter(c => campDate(c) >= cutoff);
   })();
 
-  const displayRows = listTab === "active" ? activeCamps : completedCamps;
+  const archivedFiltered = doneRange === "all" ? archivedAll : (() => {
+    const days = doneRange === "7d" ? 7 : 30;
+    const cutoff = Date.now() - days * 86400000;
+    return archivedAll.filter(c => campDate(c) >= cutoff);
+  })();
+
+  const displayRows = listTab === "active" ? activeCamps : listTab === "archived" ? archivedFiltered : completedCamps;
   const live = activeCamps.length;
   const done = completedAll.length;
+  const arch = archivedAll.length;
   const totalQual = teamFiltered.reduce((a,r)=>a+(r.qualified||0),0);
 
   return (
@@ -2016,16 +2080,19 @@ function CampaignsView({ agents, user, teams, onViewLeads }) {
       <div className="t-mast">
         <div>
           <div className="t-mast-title">Campaigns</div>
-          <div className="t-mast-sub">{teamFiltered.length} campaigns · {live} running · {done} completed</div>
+          <div className="t-mast-sub">{teamFiltered.filter(c=>!c._archived).length} campaigns · {live} running · {done} completed · {arch} archived</div>
           <div style={{display:"flex",gap:0,marginTop:10}}>
-            <button onClick={()=>setListTab("active")} style={{padding:"6px 16px",fontSize:11,fontFamily:"var(--fd)",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase",cursor:"pointer",border:"1px solid rgba(255,255,255,.25)",borderRight:"none",background:listTab==="active"?"#ffffff":"transparent",color:listTab==="active"?"var(--black)":"rgba(255,255,255,.7)"}}>
+            <button onClick={()=>handleTabChange("active")} style={{padding:"6px 16px",fontSize:11,fontFamily:"var(--fd)",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase",cursor:"pointer",border:"1px solid rgba(255,255,255,.25)",borderRight:"none",background:listTab==="active"?"#ffffff":"transparent",color:listTab==="active"?"var(--black)":"rgba(255,255,255,.7)"}}>
               Active <span style={{opacity:.6,marginLeft:4}}>{live}</span>
             </button>
-            <button onClick={()=>setListTab("completed")} style={{padding:"6px 16px",fontSize:11,fontFamily:"var(--fd)",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase",cursor:"pointer",border:"1px solid rgba(255,255,255,.25)",background:listTab==="completed"?"#ffffff":"transparent",color:listTab==="completed"?"var(--black)":"rgba(255,255,255,.7)"}}>
+            <button onClick={()=>handleTabChange("completed")} style={{padding:"6px 16px",fontSize:11,fontFamily:"var(--fd)",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase",cursor:"pointer",border:"1px solid rgba(255,255,255,.25)",borderRight:"none",background:listTab==="completed"?"#ffffff":"transparent",color:listTab==="completed"?"var(--black)":"rgba(255,255,255,.7)"}}>
               Completed <span style={{opacity:.6,marginLeft:4}}>{done}</span>
             </button>
+            <button onClick={()=>handleTabChange("archived")} style={{padding:"6px 16px",fontSize:11,fontFamily:"var(--fd)",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase",cursor:"pointer",border:"1px solid rgba(255,255,255,.25)",background:listTab==="archived"?"#e2e2e2":"transparent",color:listTab==="archived"?"var(--black)":"rgba(255,255,255,.55)"}}>
+              Archived <span style={{opacity:.6,marginLeft:4}}>{arch}</span>
+            </button>
           </div>
-          {listTab==="completed" && (
+          {(listTab==="completed"||listTab==="archived") && (
             <div style={{display:"flex",gap:0,marginTop:6}}>
               {[{id:"7d",label:"Last 7 days"},{id:"30d",label:"Last 30 days"},{id:"all",label:"All time"}].map(t=>(
                 <button key={t.id} onClick={()=>setDoneRange(t.id)} style={{padding:"3px 12px",fontSize:10,fontFamily:"var(--fd)",fontWeight:700,letterSpacing:".08em",textTransform:"uppercase",cursor:"pointer",border:"1px solid rgba(255,255,255,.2)",borderRight:"none",background:doneRange===t.id?"rgba(255,255,255,.18)":"transparent",color:"rgba(255,255,255,.75)"}}>
@@ -2056,7 +2123,7 @@ function CampaignsView({ agents, user, teams, onViewLeads }) {
       </div>
       <div style={{padding:16,background:"var(--bg)"}}>
         {loading ? <div style={{padding:60,textAlign:"center"}}><Spin/></div> : displayRows.length===0 ? (
-          <div className="t-empty">No {listTab==="active"?"active":"completed"} campaigns{selTeam?" for this team":""}.</div>
+          <div className="t-empty">No {listTab==="active"?"active":listTab==="archived"?"archived":"completed"} campaigns{selTeam?" for this team":""}.</div>
         ) : displayRows.map(c=>{
           const pct = c.contactsCount>0 ? Math.round(((c.completed||0)+(c.notConnected||0)+(c.failed||0))/c.contactsCount*100) : 0;
           const isLive = c.status==="IN_PROGRESS";
@@ -2068,6 +2135,7 @@ function CampaignsView({ agents, user, teams, onViewLeads }) {
                   <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
                     <span style={{fontFamily:"var(--fd)",fontWeight:700,fontSize:13}}>{c.campaignName||c.requestId.slice(-12)}</span>
                     <StatusPill status={c.status}/>
+                    {c._archived && <span className="t-pill t-pill-arch">Archived</span>}
                     {c.triggeredByTeam && <span className="t-pill t-pill-blue">{c.triggeredByTeam}</span>}
                   </div>
                   <div style={{fontFamily:"var(--fm)",fontSize:10,color:"var(--muted)",marginTop:2}}>
@@ -2082,6 +2150,9 @@ function CampaignsView({ agents, user, teams, onViewLeads }) {
                 </div>
                 <div style={{display:"flex",gap:8,alignItems:"center",flexShrink:0}}>
                   {(c.qualified||0)>0 && <button className="t-btn t-btn-outline t-btn-sm" onClick={e=>{e.stopPropagation();onViewLeads&&onViewLeads(c.agentCode,c.requestId);}}>View Leads →</button>}
+                  {user.role==="super_admin" && isLive && (
+                    <ForceCompleteBtn agentCode={c.agentCode} requestId={c.requestId} onDone={()=>loadCampaigns(listTab==="archived")}/>
+                  )}
                 </div>
               </div>
               <div className="c-card-stats">
@@ -2226,7 +2297,7 @@ function CampaignMasterTab({ campaign }) {
     setTimeout(()=>setPassMsg(""), 3000);
   }
 
-  const metaCols = ["Call ID","Callee Name","Mobile Number","Status","Duration (Minutes)","Duration (Seconds)","Started At","Ended At","Answered By","Engagement Status","Call Ended By","Recording URL"];
+  const metaCols = ["Call ID","Callee Name","Mobile Number","Status","Lifecycle Status","Duration (Minutes)","Duration (Seconds)","Started At","Ended At","Answered By","Engagement Status","Call Ended By","Recording URL"];
   const outCols = headers.filter(h=>h.startsWith("out."));
   const inCols = headers.filter(h=>h.startsWith("in."));
   const shownHeaders = [...metaCols.filter(h=>headers.includes(h)), ...inCols, ...outCols];
@@ -2235,16 +2306,22 @@ function CampaignMasterTab({ campaign }) {
 
   function colLabel(h) {
     if(h==="Recording URL") return "Recording";
+    if(h==="Lifecycle Status") return "Lifecycle";
     if(h.startsWith("out.")) return h.slice(4);
     if(h.startsWith("in.")) return "↓"+h.slice(3);
     return h;
   }
-  function renderCell(h, val) {
+  function renderCell(h, val, row) {
     const strVal = String(val??"")||"";
     if(h==="Recording URL") return <RecBtn url={strVal}/>;
     if(!strVal) return <span style={{color:"#ccc"}}>—</span>;
     if(h.startsWith("out.")||h.startsWith("in.")) return <div className="out-cell" title={strVal}>{strVal}</div>;
-    if(h==="Status") return <StatusPill status={strVal}/>;
+    if(h==="Status") return <StatusPill status={strVal} lifecycleStatus={String(row["Lifecycle Status"]||"")}/>;
+    if(h==="Lifecycle Status") {
+      const ls = strVal.toUpperCase();
+      const lsMap = { COMPLETED:"done", IN_PROGRESS:"live", NOT_CONNECTED:"hold", FAILED:"arch", CANCELLED:"arch", NOT_STARTED:"gray" };
+      return <span className={"t-pill t-pill-"+(lsMap[ls]||"gray")} style={{fontSize:9}}>{ls||"—"}</span>;
+    }
     if(h==="Call ID"||h==="Mobile Number") return <span className="t-mono" style={{fontSize:10}}>{strVal}</span>;
     if(h==="Started At"||h==="Ended At") return <span style={{fontSize:10,fontFamily:"var(--fm)",color:"var(--muted)"}}>{strVal?fmtDT(strVal):""}</span>;
     return <span style={{fontSize:12}}>{strVal}</span>;
@@ -2273,7 +2350,7 @@ function CampaignMasterTab({ campaign }) {
               const isPassing = passingToQL.has(callId);
               return (
                 <tr key={i}>
-                  {shownHeaders.map(h=><td key={h}>{renderCell(h,row[h])}</td>)}
+                  {shownHeaders.map(h=><td key={h}>{renderCell(h,row[h],row)}</td>)}
                   <td style={{background:"#fafff8",borderLeft:"1px solid #e0f5e8"}}>
                     {alreadyPassed ? <span className="pass-ql-done">✓ In QL</span> : isPassing ? <span style={{display:"inline-flex",alignItems:"center",gap:4,fontSize:11,color:"var(--muted)"}}><Spin/>Adding…</span> : <button className="pass-ql-btn" onClick={()=>passToQL(row)}><svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M1 5h8M6 2l3 3-3 3"/></svg>Pass to QL</button>}
                   </td>
@@ -3383,10 +3460,14 @@ function TestCallModal({ agent, onClose }) {
           return;
         }
         const row = r.rows[0];
-        const status = String(row["Status"] || "").toUpperCase();
+        const status          = String(row["Status"]          || "").toUpperCase();
+        const lifecycleStatus = String(row["Lifecycle Status"] || "").toUpperCase();
         setPollStatus(status);
+        // Use lifecycle_status for the FINAL check — status=NOT_CONNECTED during
+        // retries doesn't mean done. lifecycle_status=NOT_CONNECTED means all retries exhausted.
+        const effectiveFinal = lifecycleStatus || status;
         const FINAL = ["COMPLETED", "NOT_CONNECTED", "CANCELLED", "FAILED"];
-        if (FINAL.includes(status)) {
+        if (FINAL.includes(effectiveFinal)) {
           clearInterval(pollRef.current);
           setEvalLoading(false);
           setPollDone(true);
@@ -3600,10 +3681,12 @@ function TestCallPanel({ agent }) {
         const r = await api("getMasterTracker", { agentCode: agent.agentCode, requestId: triggered.requestId });
         if (!r.ok || !r.rows?.length) { if(attempts>=40){clearInterval(pollRef.current);setEvalLoading(false);setPollDone(true);} return; }
         const row = r.rows[0];
-        const status = String(row["Status"]||"").toUpperCase();
+        const status          = String(row["Status"]          || "").toUpperCase();
+        const lifecycleStatus = String(row["Lifecycle Status"] || "").toUpperCase();
         setPollStatus(status);
+        const effectiveFinal = lifecycleStatus || status;
         const FINAL = ["COMPLETED","NOT_CONNECTED","CANCELLED","FAILED"];
-        if (FINAL.includes(status)) {
+        if (FINAL.includes(effectiveFinal)) {
           clearInterval(pollRef.current); setEvalLoading(false); setPollDone(true);
           if (status==="COMPLETED" && resultFields.length) {
             const ev = {};
