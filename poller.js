@@ -1080,6 +1080,10 @@ async function _pollAgent(agent, userRoleMap, triggerMap, pollCap = POLL_BUDGET.
       }
     }
 
+    const hasResult = resultFields.some(f => {
+      const col = mtHeaders.indexOf('out.' + f);
+      return col >= 0 && String(row[col] || '').trim() !== '';
+    });
     const priority = rowPriority(status, hasResult);
 
     // Resolve which day/campaign this row belongs to
